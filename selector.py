@@ -5,10 +5,11 @@ is deciding which tests a change cannot break.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 
-DATA = Path("/data")
+DATA = Path(os.environ.get("BR_DATA", "/data"))  # BR_DATA: local evaluation (tools/eval.py)
 WORKERS = 3
 
 
