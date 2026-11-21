@@ -129,13 +129,16 @@ class Block:
 
 
 class FileChange:
-    __slots__ = ("old", "new", "blocks", "binary")
+    __slots__ = ("old", "new", "blocks", "binary", "hunks")
 
     def __init__(self):
         self.old: str | None = None
         self.new: str | None = None
         self.blocks: list[Block] = []
         self.binary = False
+        # raw hunks for applying the patch (phase 4): [old_start, old_count, [(tag, text)],
+        # old_no_eol, new_no_eol, new_count]
+        self.hunks: list[list] = []
 
     @property
     def path(self) -> str | None:
@@ -210,6 +213,8 @@ def parse_patch(text: str) -> list[FileChange]:
             old_ln = int(m.group(1))
             old_cnt = int(m.group(2)) if m.group(2) is not None else 1
             new_cnt = int(m.group(4)) if m.group(4) is not None else 1
+            hunk = [old_ln, old_cnt, [], False, False, new_cnt]
+            cur.hunks.append(hunk)
             if old_cnt == 0:
                 old_ln += 1  # "-k,0" means: insert after old line k
             i += 1
@@ -219,9 +224,14 @@ def parse_patch(text: str) -> list[FileChange]:
             while i < n and (o_left > 0 or n_left > 0):
                 hl = lines[i]
                 if hl.startswith("\\"):
+                    if hunk[2]:
+                        t = hunk[2][-1][0]
+                        hunk[3] = hunk[3] or t in " -"
+                        hunk[4] = hunk[4] or t in " +"
                     i += 1
                     continue
                 tag, body = (hl[:1], hl[1:]) if hl else (" ", "")
+                hunk[2].append((tag if tag in "+-" else " ", body))
                 if tag == "-":
                     if block is None:
                         block = Block(old_ln, prev_text)
@@ -243,6 +253,12 @@ def parse_patch(text: str) -> list[FileChange]:
                     old_ln += 1
                     o_left -= 1
                     n_left -= 1
+                i += 1
+            # a trailing "\ No newline" line right after the hunk's last line
+            if i < n and lines[i].startswith("\\") and hunk[2]:
+                t = hunk[2][-1][0]
+                hunk[3] = hunk[3] or t in " -"
+                hunk[4] = hunk[4] or t in " +"
                 i += 1
             continue
         i += 1
@@ -366,6 +382,8 @@ class Selector:
     def __init__(self, maps: Maps):
         self.m = maps
         self.core = set(maps.meta.get("core_modules", []))
+        self.noncov = 0                           # tests selected NOT via runtime coverage
+        self.covlines: list[tuple[str, int]] = []  # (file, line) whose coverage was used
 
     # ---- users of a module: tests that executed it or used a class defined in it
     def mod_users(self, f: str, with_importers: bool = True) -> int:
@@ -432,10 +450,15 @@ class Selector:
         return {ln for ln in lines if ln >= 1}
 
     def python_line(self, f: str, p: dict, ln: int, block: Block) -> int:
+        """Tests for one affected line. Records in self.covlines the (file, line) pairs whose
+        runtime coverage was used, and ORs every other source into self.noncov (phase 4:
+        split tests can be narrowed to units only when selected through coverage alone)."""
         bits = 0
+        nc = 0
         cov = p["cov"].get(str(ln))
         if cov is not None:
             bits |= self.m.s(p, cov)
+            self.covlines.append((f, ln))
         mods = p["imp"].get(str(ln))
         chain = scopes(p["struct"], ln)
         inner = chain[-1] if chain else None
@@ -453,41 +476,50 @@ class Selector:
             # header line (decorators, signature, default values, bases)
             if inner[2] == "f":
                 bits |= self.body_cov(p, inner[6], inner[1])
+                self.covlines.extend((f, x) for x in range(inner[6], inner[1] + 1))
             else:
-                bits |= self.class_users(p, f, inner[3]) or self.mod_users(f)
-                bits |= self.body_cov(p, inner[0], inner[1])
+                nc |= self.class_users(p, f, inner[3]) or self.mod_users(f)
+                nc |= self.body_cov(p, inner[0], inner[1])
             chain = chain[:-1]
             inner = chain[-1] if chain else None
             if (inner is None or inner[2] == "c") and f.startswith("tests/"):
-                bits |= self.m.s(p, p["file_tests"])  # test methods are collected by name
-            return bits
+                nc |= self.m.s(p, p["file_tests"])  # test methods are collected by name
+            self.noncov |= nc
+            return bits | nc
         if inner is not None and inner[2] == "f":
             if mods:  # a function body that ran at import time (metaclass, module-level call)
                 for mf in mods:
-                    bits |= self.mod_users(mf) | self.collect_users(mf)
-            return bits
+                    nc |= self.mod_users(mf) | self.collect_users(mf)
+            self.noncov |= nc
+            return bits | nc
         if inner is not None and inner[2] == "c":
             cu = self.class_users(p, f, inner[3])
             if f.startswith("tests/"):
                 cu |= self.m.s(p, p["file_tests"]) | self.m.s(p, p["collect_users"])
             if not cu:
                 cu = self.mod_users(f)
+            self.noncov |= cu
             return bits | cu
         # module level
-        bits |= self.mod_users(f)
-        return bits
+        nc |= self.mod_users(f)
+        self.noncov |= nc
+        return bits | nc
 
     def python_file(self, fc: FileChange, why: list) -> int:
         f = fc.old
         p = self.m.file(f)
         bits = self.m.data_users(f, include_dirs=False)  # tests reading the source as text
+        self.noncov |= bits
         if p is None:
             why.append(f"{f}: not in maps -> all")
+            self.noncov |= self.m.all
             return self.m.all
         if fc.new is None or fc.new != fc.old:  # deleted or renamed away
             why.append(f"{f}: deleted/renamed -> module users + collection")
-            return bits | self.mod_users(f) | self.collect_users(f) | self.body_cov(
+            r = bits | self.mod_users(f) | self.collect_users(f) | self.body_cov(
                 p, 1, max([e[1] for e in p["struct"]] + [1]) + 1000)
+            self.noncov |= r
+            return r
         for block in fc.blocks:
             if non_semantic(p, block):
                 continue
@@ -514,35 +546,44 @@ class Selector:
         return bits
 
     def select(self, text: str, why: list) -> int:
+        self.noncov = 0
+        self.covlines = []
+        return self._select(text, why)
+
+    def _select(self, text: str, why: list) -> int:
         try:
             files = parse_patch(text)
         except Exception as e:  # noqa: BLE001
             why.append(f"unparseable patch ({e!r}) -> all")
+            self.noncov = self.m.all
             return self.m.all
         if not files:
             why.append("no file changes found -> all" if text.strip() else "empty patch")
-            return self.m.all if text.strip() else 0
+            self.noncov = self.m.all if text.strip() else 0
+            return self.noncov
         bits = 0
         for fc in files:
             path = fc.path
             if path is None:
                 continue
             if fc.binary:
-                bits |= self.m.data_users(path) if not path.endswith(".py") else self.m.all
-                continue
-            if path.endswith(".py") and (path.startswith(("sqlglot/", "tests/"))):
+                b = self.m.data_users(path) if not path.endswith(".py") else self.m.all
+            elif path.endswith(".py") and (path.startswith(("sqlglot/", "tests/"))):
                 if fc.old is None:  # new module
                     b = self.m.data_users(fc.new)
                     why.append(f"{fc.new}: new file -> {bin(b).count('1')} (dir listings)")
-                    bits |= b
                 elif fc.new is not None and fc.new != fc.old:  # rename
-                    bits |= self.python_file(fc, why) | self.m.data_users(fc.new)
-                else:
+                    b = self.m.data_users(fc.new)
                     bits |= self.python_file(fc, why)
+                else:
+                    bits |= self.python_file(fc, why)  # tracks noncov itself
+                    continue
             elif path.endswith(".py") and path.split("/")[-1] == "conftest.py":
-                bits |= self.m.all
+                b = self.m.all
             else:
-                bits |= self.data_file(fc, why)
+                b = self.data_file(fc, why)
+            self.noncov |= b
+            bits |= b
         return bits
 
 

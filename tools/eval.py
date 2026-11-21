@@ -70,6 +70,8 @@ def main() -> None:
     g.add_argument("--output", type=Path)
     ap.add_argument("--save", type=Path, help="save the selector's stdout here")
     ap.add_argument("-v", "--verbose", action="store_true", help="per-commit table")
+    ap.add_argument("--env", action="append", default=[], help="KEY=VAL passed to the container")
+    ap.add_argument("--log", type=Path, help="save the container's stderr here")
     a = ap.parse_args()
 
     tests = json.loads((a.data / "tests.json").read_text())["tests"]
@@ -95,7 +97,7 @@ def main() -> None:
                 (data / "commits" / f"{k}.patch").write_bytes(p.read_bytes())
             (data / "tests.json").write_bytes((a.data / "tests.json").read_bytes())
             if a.image:
-                cmd = ["docker", "run", *RUN_FLAGS,
+                cmd = ["docker", "run", *RUN_FLAGS, *[x for e in a.env for x in ("--env", e)],
                        "-v", f"{data / 'commits'}:/data/commits:ro",
                        "-v", f"{data / 'tests.json'}:/data/tests.json:ro",
                        "-v", f"{ROOT / 'tools' / 'cpuwrap.py'}:/cpuwrap.py:ro",
@@ -109,6 +111,8 @@ def main() -> None:
             pr = subprocess.run(cmd, capture_output=True, env=env)
             r1 = resource.getrusage(resource.RUSAGE_CHILDREN)
             stdout, stderr = pr.stdout, pr.stderr.decode(errors="replace")
+            if a.log:
+                a.log.write_text(stderr)
             if a.cmd:
                 cpu = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime)
             m = re.search(r"@@CPUWRAP cpu=([\d.]+) wall=([\d.]+) maxrss_kb=(\d+)", stderr)

@@ -39,6 +39,8 @@ import traceback
 from pathlib import Path
 
 ROOT = "/opt/sqlglot"
+sys.path.insert(0, os.environ.get("BR_APP", "/app"))
+import verify  # noqa: E402  (app/verify.py: SPLITS and restrict(), shared with the verifier)
 ROOT_PREFIX = ROOT + "/"
 mon = sys.monitoring
 TOOL = mon.COVERAGE_ID
@@ -276,7 +278,7 @@ class Result:
                 traceback.format_exception_only(err[0], err[1]))[-300:])
 
 
-def run_one(tid: str, out: Path, timeout: int) -> None:
+def run_one(tid: str, out: Path, timeout: int, units: list | None = None) -> None:
     import signal
     import unittest
 
@@ -290,7 +292,10 @@ def run_one(tid: str, out: Path, timeout: int) -> None:
         signal.alarm(timeout)
         mod = sys.modules.get(mod_name) or __import__(mod_name, fromlist=["x"])
         test_cls = getattr(mod, cls_name)
-        suite = unittest.TestSuite([test_cls(meth)])
+        test = test_cls(meth)
+        if units is not None:
+            verify.restrict(test, tid, units)
+        suite = unittest.TestSuite([test])
         res = Result()
         STATE["mode"] = "test"
         mon.restart_events()
@@ -303,8 +308,16 @@ def run_one(tid: str, out: Path, timeout: int) -> None:
     except BaseException as e:  # noqa: BLE001
         STATE["mode"] = "idle"
         err = "harness: " + "".join(traceback.format_exception(e))[-2000:]
+    n_units = None
+    if tid in verify.SPLITS and units is None:
+        try:
+            n_units = verify.unit_count(test, tid)
+        except Exception:  # noqa: BLE001
+            pass
     data = {
         "id": tid,
+        "units": units,
+        "n_units": n_units,
         "ok": ok,
         "err": err,
         "wall": round(time.perf_counter() - t0, 3),
@@ -477,6 +490,36 @@ def main() -> None:
     while running:
         reap(True)
     print(f"[trace] all {len(todo)} tests in {time.perf_counter() - t1:.0f}s", file=sys.stderr)
+
+    # 5. split tests: one cold child per unit (the full run above recorded the unit count)
+    (a.out / "units").mkdir(exist_ok=True)
+    unit_jobs = []
+    for tid in tests:
+        if tid not in verify.SPLITS:
+            continue
+        full = json.loads((a.out / "tests" / f"{index[tid]}.json").read_text())
+        for u in range(full.get("n_units") or 0):
+            dst = a.out / "units" / f"{index[tid]}_{u}.json"
+            if not dst.exists():
+                unit_jobs.append((tid, u, dst))
+    t2 = time.perf_counter()
+    for tid, u, dst in unit_jobs:
+        while len(running) >= a.jobs:
+            reap(True)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                TEST_LINES.clear()
+                IMPORT_LINES.clear()
+                run_one(tid, dst, a.timeout, [u])
+            except BaseException:  # noqa: BLE001
+                traceback.print_exc()
+                os._exit(3)
+            os._exit(0)
+        running[pid] = f"{tid}[{u}]"
+    while running:
+        reap(True)
+    print(f"[trace] {len(unit_jobs)} units in {time.perf_counter() - t2:.0f}s", file=sys.stderr)
 
 
 if __name__ == "__main__":

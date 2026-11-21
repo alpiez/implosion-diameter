@@ -1,0 +1,364 @@
+"""Entry logic: static selection (blast.py), then optional verification (verify.py).
+
+1. Static candidates S for every commit, exactly as in phase 3.
+2. Plan: for each commit, the verification set V is S minus its m most expensive
+   tests (m = 0..40), chosen to maximise
+        gain = pack(S) - pack(S - V) - cpu(V) - overhead(V)
+   using per-test CPU measured on the pinned commit (maps/vcpu.json). Commits whose
+   best gain is under MARGIN are not verified. Verifying never adds risk beyond the
+   harness itself: a test is dropped only if it ran and passed on the patched tree.
+3. Verify the planned commits, best gain first, two at a time, within a wall budget.
+4. Output S minus the tests that passed, packed (best k in 1..8, LPT).
+Any failure in steps 2-3 leaves that commit (or all commits) at S.
+"""
+
+import json
+import os
+import sys
+import time
+
+import blast
+
+T_START = time.monotonic()
+MARGIN_MS = int(os.environ.get("BR_MARGIN_MS", "300"))
+# prior probability that all verified candidates pass (tuned on synthetic patches)
+Q_DATA = float(os.environ.get("BR_Q_DATA", "0.1"))   # only data files (fixtures) changed
+Q_CODE = float(os.environ.get("BR_Q_CODE", "0.35"))  # any .py change
+# the scorer's CPU may be slower than ours: a plan must also beat this fraction of its CPU
+MARGIN_REL = float(os.environ.get("BR_MARGIN_REL", "0.15"))
+MAX_REST = 40                      # largest number of expensive tests kept unverified
+BASE_OVERHEAD_S = 0.10             # fork, overlay, import sqlglot (precompiled)
+IMPORT_FLOOR_S = 0.048             # the smallest per-file overhead = the shared bare import
+PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
+BUDGET_PER_COMMIT_S = 2.25         # the limit is about 4.5 s of wall time per commit
+BUDGET_CAP_S = float(os.environ.get("BR_BUDGET_CAP", "150"))
+
+
+def log(*a) -> None:
+    print("[runner]", *a, file=sys.stderr, flush=True)
+
+
+def pack_cost(durs: list[int]) -> int:
+    if not durs:
+        return 0
+    durs = sorted(durs, reverse=True)
+    best = None
+    for k in range(1, min(blast.MAX_WORKERS, len(durs)) + 1):
+        loads = [0] * k
+        for d in durs:
+            i = loads.index(min(loads))
+            loads[i] += d
+        c = max(loads) + blast.WORKER_MS * k
+        if best is None or c < best:
+            best = c
+    return best
+
+
+def overhead(files, file_ovh: dict) -> float:
+    """Child CPU besides the tests: base + each test file's own imports and class fixtures
+    (measured per file on the clean tree, minus the shared import of sqlglot)."""
+    return BASE_OVERHEAD_S + sum(max(0.0, file_ovh.get(f, 0.3) - IMPORT_FLOOR_S) for f in files)
+
+
+def pack_estimate(total: int, longest: int, count: int) -> int:
+    """Lower bound of the packed cost (max(longest, total/k) + 2 s * k, best k): O(1),
+    close to LPT for these sets. Used only for planning; the output uses blast.pack."""
+    if count <= 0:
+        return 0
+    best = None
+    for k in range(1, min(blast.MAX_WORKERS, count) + 1):
+        c = max(longest, -(-total // k)) + blast.WORKER_MS * k
+        if best is None or c < best:
+            best = c
+    return best
+
+
+def plan_commit(S: list[int], dur: dict, cpu: dict, file_ovh: dict, file_of: dict,
+                q: float = 1.0):
+    """Best (expected gain ms, V) for candidate numbers S; V == [] means do not verify.
+
+    Candidates are ordered by verification CPU per ms of selected duration (best value
+    first) and every prefix V is scored:
+        gain = pack(S) - E[pack after] - (1 + MARGIN_REL) * (cpu(V) + overhead(V))
+    with E[pack after] = qv * pack(S - V) + (1 - qv) * pack(S - V + cheapest test of V):
+    q is the prior that all of S passes, spread evenly over the candidates
+    (qv = q ** (|V| / |S|)); if V does not all pass, at least one test of V stays."""
+    if not S:
+        return 0, []
+    n = len(S)
+    def value(x):  # CPU to verify (incl. its file's own overhead) per ms of duration
+        fo = max(0.0, file_ovh.get(file_of[x], 0.3) - IMPORT_FLOOR_S)
+        return ((cpu[x] + fo) / max(dur[x], 1), cpu[x], x)
+
+    order = sorted(S, key=value)
+    durs = [dur[x] for x in order]
+    total = sum(durs)
+    base = pack_estimate(total, max(durs), n)
+    suffix_max = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_max[i] = max(suffix_max[i + 1], durs[i])
+    best_gain, best_len = 0, 0
+    pre_d = 0
+    pre_cpu = 0.0
+    min_v = None
+    files: set = set()
+    ovh = BASE_OVERHEAD_S
+    for i, x in enumerate(order):
+        pre_d += durs[i]
+        pre_cpu += cpu[x]
+        min_v = durs[i] if min_v is None else min(min_v, durs[i])
+        f = file_of[x]
+        if f not in files:
+            files.add(f)
+            ovh += max(0.0, file_ovh.get(f, 0.3) - IMPORT_FLOOR_S)
+        rest_n = n - i - 1
+        rest_total = total - pre_d
+        clean = pack_estimate(rest_total, suffix_max[i + 1], rest_n)
+        dirty = min(base, pack_estimate(rest_total + min_v, max(suffix_max[i + 1], min_v),
+                                        rest_n + 1))
+        qv = q ** ((i + 1) / n)  # failures spread evenly over the candidates
+        exp_after = qv * clean + (1 - qv) * dirty
+        gain = int(base - exp_after - 1000 * (1 + MARGIN_REL) * (pre_cpu + ovh))
+        if gain > best_gain:
+            best_gain, best_len = gain, i + 1
+    return best_gain, order[:best_len]
+
+
+def worth_continuing(job_failed: set, job_done: set, V: list, rest_d: list, dur: dict,
+                     ccpu: dict) -> bool:
+    """After a failure inside a job: is verifying the remaining tests still worth their CPU?
+    (Dropping them only helps if they would all pass; failures tend to cluster: q = 0.5.)"""
+    if not job_failed:
+        return True
+    left = [n for n in V if n not in job_done]
+    if not left:
+        return True
+    kept = rest_d + [dur[n] for n in job_failed]
+    now = pack_cost(kept + [dur[n] for n in left])
+    best = pack_cost(kept)
+    return 0.5 * (now - best) > 1000 * sum(ccpu[n] for n in left) + MARGIN_MS
+
+
+def prior_q(files) -> float:
+    """Prior that the candidates all pass: fixture corruptions nearly always break their
+    reader, code edits often do not (equivalent or uncovered mutants)."""
+    if files and all(not (fc.path or "").endswith(".py") for fc in files):
+        return Q_DATA
+    return Q_CODE
+
+
+def main() -> None:
+    data = blast.DATA
+    tests = json.loads((data / "tests.json").read_text())["tests"]
+    num_by_id, dur, id_of = {}, {}, {}
+    for t in tests:
+        num_by_id[t["id"]] = t["number"]
+        id_of[t["number"]] = t["id"]
+        dur[t["number"]] = blast.duration_ms(t.get("seconds", 0))
+    all_numbers = sorted(dur)
+    patches = sorted((data / "commits").glob("*.patch"))
+
+    # ---- 1. static selection
+    try:
+        maps = blast.Maps(blast.MAPS)
+        sel = blast.Selector(maps)
+        bit_num = [num_by_id.get(tid) for tid in maps.tests]
+        unknown = set(dur) - {n for n in bit_num if n is not None}
+        if unknown:
+            log(f"{len(unknown)} tests not in maps: always selected")
+    except Exception as e:  # noqa: BLE001
+        log(f"maps unavailable ({e!r}): selecting everything")
+        maps = sel = None
+        bit_num, unknown = [], set(all_numbers)
+
+    static: dict[str, list[int]] = {}
+    texts: dict[str, str] = {}
+    info: dict[str, tuple[int, list]] = {}  # commit -> (non-coverage bits, coverage lines)
+    for patch in patches:
+        commit = patch.stem
+        why: list[str] = []
+        try:
+            if sel is None:
+                nums = all_numbers
+            else:
+                text = patch.read_text(encoding="utf-8", errors="replace")
+                texts[commit] = text
+                bits = sel.select(text, why)
+                info[commit] = (sel.noncov, sel.covlines)
+                nums = set(unknown) if bits else set()
+                x = bits
+                while x:
+                    low = x & -x
+                    i = low.bit_length() - 1
+                    if i < len(bit_num) and bit_num[i] is not None:
+                        nums.add(bit_num[i])
+                    x ^= low
+                nums = sorted(nums)
+        except Exception as e:  # noqa: BLE001
+            why.append(f"error {e!r} -> all")
+            nums = all_numbers
+        static[commit] = nums
+        log(f"{commit}: static {len(nums)} tests | " + "; ".join(why)[:200])
+
+    # ---- 2.-3. verification
+    final = dict(static)
+    if os.environ.get("BR_VERIFY", "1") != "0" and patches:
+        try:
+            verified = verify_commits(static, texts, dur, id_of, num_by_id, len(patches),
+                                      maps, info)
+            for commit, passed in verified.items():
+                final[commit] = [n for n in static[commit] if n not in passed]
+        except Exception as e:  # noqa: BLE001
+            log(f"verification disabled: {e!r}")
+
+    # ---- 4. output
+    out = []
+    for patch in patches:
+        commit = patch.stem
+        try:
+            workers = blast.pack([(n, dur[n]) for n in final[commit]])
+        except Exception:  # noqa: BLE001
+            workers = blast.pack([(n, dur[n]) for n in all_numbers])
+        out.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
+    sys.stdout.write("\n".join(out) + ("\n" if out else ""))
+    sys.stdout.flush()
+    log(f"done in {time.monotonic() - T_START:.1f}s wall")
+
+
+class Units:
+    """Per-unit coverage of the split tests (maps/units.bin, verify.SPLITS)."""
+
+    def __init__(self, maps, vc: dict, splits: dict):
+        import zlib
+        self.maps = maps
+        try:
+            raw = json.loads(zlib.decompress((blast.MAPS / "units.bin").read_bytes()))
+        except Exception as e:  # noqa: BLE001
+            log(f"units unavailable: {e!r}")
+            raw = {}
+        ucpu = vc.get("units", {})
+        self.whole = vc.get("cpu", {})
+        self.tests = {}
+        index = {t: i for i, t in enumerate(maps.tests)}
+        for tid, d in raw.items():
+            c = ucpu.get(tid)
+            if (tid in splits and d.get("ok") and tid in index and c and len(c) == d["n"]
+                    and all(x is not None for x in c)):
+                self.tests[tid] = (index[tid], d, c)
+
+    def reachable(self, tid: str, noncov: int, covlines: list):
+        """(unit indices, cpu) for this commit, or None when the whole test must run."""
+        if tid not in self.tests:
+            return None
+        bit, d, ucpu = self.tests[tid]
+        if noncov >> bit & 1:
+            return None                      # selected through class/module/data users
+        mask = 0
+        found = False
+        for f, ln in covlines:
+            p = self.maps.file(f)
+            si = p["cov"].get(str(ln)) if p else None
+            if si is None or not (self.maps.s(p, si) >> bit & 1):
+                continue
+            found = True
+            ub = d["lines"].get(f, {}).get(str(ln))
+            if ub is None:
+                return None                  # executed by the full run but by no single unit
+            mask |= int(ub, 16)
+        if not found or mask == (1 << d["n"]) - 1:
+            return None
+        units = [u for u in range(d["n"]) if mask >> u & 1]
+        # units measured alone are cold (sum > whole test); scale to the whole test's CPU
+        whole = float(self.whole.get(tid, sum(ucpu)))
+        return units, whole * sum(ucpu[u] for u in units) / max(sum(ucpu), 1e-9)
+
+
+class Planner:
+    """Per-commit verification plan: which candidates to run (and which units of split tests)."""
+
+    def __init__(self, dur: dict, id_of: dict, num_by_id: dict, maps, splits: dict):
+        vc = json.loads((blast.MAPS / "vcpu.json").read_text())
+        self.dur = dur
+        self.id_of = id_of
+        self.file_ovh = vc["file_overhead"]
+        self.cpu = {n: float(vc["cpu"].get(id_of[n], max(0.05, dur[n] / 1000))) for n in dur}
+        self.file_of = {n: id_of[n].split("::")[0] for n in dur}
+        self.units = Units(maps, vc, splits) if maps is not None else None
+        self.split_nums = {num_by_id[t]: t for t in (self.units.tests if self.units else {})
+                           if t in num_by_id}
+
+    def plan(self, S: list[int], files: list, info) -> tuple[int, list, dict, dict]:
+        """(expected gain ms, V, cpu estimates, {number: unit indices})."""
+        ccpu, cunits = self.cpu, {}
+        for n in self.split_nums.keys() & set(S):
+            r = self.units.reachable(self.split_nums[n], *(info or (-1, [])))
+            if r is not None:
+                if ccpu is self.cpu:
+                    ccpu = dict(self.cpu)
+                cunits[n], ccpu[n] = r
+        gain, V = plan_commit(S, self.dur, ccpu, self.file_ovh, self.file_of, prior_q(files))
+        return gain, sorted(V), ccpu, cunits
+
+
+def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
+                   info=None) -> dict[str, set[int]]:
+    """Returns {commit: numbers of tests that ran and passed on the patched tree}."""
+    import verify
+    if not (verify.SRC / "sqlglot" / "__init__.py").is_file():
+        log(f"no checkout at {verify.SRC}: static only")
+        return {}
+    planner = Planner(dur, id_of, num_by_id, maps, verify.SPLITS)
+    info = info or {}
+    plans = []
+    for commit, S in static.items():
+        if not S or commit not in texts:
+            continue
+        try:
+            files = blast.parse_patch(texts[commit])
+            if any(not p.startswith(verify.VERIFY_ROOTS)
+                   for fc in files for p in (fc.old, fc.new) if p is not None):
+                continue
+            gain, V, ccpu, cunits = planner.plan(S, files, info.get(commit))
+            if gain < MARGIN_MS or not V:
+                continue
+            changes = verify.patched_files(files)
+        except Exception as e:  # noqa: BLE001
+            log(f"{commit}: not verifiable ({e})")
+            continue
+        V.sort(key=lambda n: (ccpu[n], n))  # cheapest first: failures show up early
+        tl = [(id_of[n], 3.0 * ccpu[n] + 3.0, cunits.get(n)) for n in V]
+        for n in V:
+            if n in cunits:
+                log(f"{commit}: {id_of[n].split('::')[-1]} narrowed to {len(cunits[n])} units")
+        job = verify.Job(commit, changes, tl)
+        rest_d = [dur[n] for n in S if n not in set(V)]
+
+        def check(job, V=V, rest_d=rest_d, ccpu=ccpu):
+            failed = {num_by_id[t] for t in job.failed if t in num_by_id}
+            done = failed | {num_by_id[t] for t in job.passed if t in num_by_id}
+            return worth_continuing(failed, done, V, rest_d, dur, ccpu)
+
+        job.on_result = check
+        plans.append((gain, commit, job))
+    if not plans:
+        return {}
+    plans.sort(key=lambda p: (-p[0], p[1]))
+    if sys.flags.no_site:
+        import site
+        site.main()  # main.py runs with -S; the tests need site-packages
+    v = verify.Verifier(parallel=PARALLEL)
+    budget = min(BUDGET_CAP_S, BUDGET_PER_COMMIT_S * n_commits)
+    deadline = T_START + budget
+    jobs = [p[2] for p in plans]
+    log(f"verifying {len(jobs)} commits, planned gain {sum(p[0] for p in plans) / 1000:.1f}s, "
+        f"budget {budget:.0f}s")
+    v.run(jobs, deadline)
+    out = {}
+    for gain, commit, job in plans:
+        passed = {num_by_id[t] for t in job.passed if t in num_by_id} - \
+                 {num_by_id[t] for t in job.failed if t in num_by_id}
+        out[commit] = passed
+        log(f"{commit}: verified {len(job.tests)} -> passed {len(passed)}, failed {len(job.failed)}, "
+            f"cpu {job.child_cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")
+    log(f"verification cpu {v.cpu_children:.1f}s")
+    return out

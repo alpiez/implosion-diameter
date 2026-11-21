@@ -329,6 +329,38 @@ def main() -> None:
     (a.out / "meta.json").write_text(json.dumps(out_meta, separators=(",", ":")))
     for p in (a.out / "files.bin", a.out / "meta.json"):
         os.chmod(p, 0o644)
+
+    # per-unit coverage of split tests (app/verify.py SPLITS), from trace/units/<test>_<unit>.json:
+    # units.bin = zlib(json {test id: {"n", "ok", "cpu": [traced cpu per unit],
+    #                                  "lines": {file: {line: hex bitset over units}}}})
+    udir = a.trace / "units"
+    units_out = {}
+    if udir.is_dir():
+        by_test: dict[int, dict[int, dict]] = defaultdict(dict)
+        for p in sorted(udir.glob("*.json")):
+            ti, u = map(int, p.stem.split("_"))
+            by_test[ti][u] = json.loads(p.read_text())
+        for ti, us in sorted(by_test.items()):
+            nunits = max(us) + 1
+            ok = all(us.get(u, {}).get("ok") for u in range(nunits))
+            if not ok:
+                problems.append(f"units of {tests[ti]}: not all pass on the clean tree (unused)")
+            ul: dict[str, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+            for u, d in us.items():
+                for f, ls in d["lines"].items():
+                    for ln in ls:
+                        ul[f][ln] |= 1 << u
+            units_out[tests[ti]] = {
+                "n": nunits, "ok": ok,
+                "cpu": [us.get(u, {}).get("cpu", 0) for u in range(nunits)],
+                "lines": {f: {str(ln): format(bits, "x") for ln, bits in sorted(d.items())}
+                          for f, d in sorted(ul.items())},
+            }
+    (a.out / "units.bin").write_bytes(zlib.compress(
+        json.dumps(units_out, separators=(",", ":"), sort_keys=True).encode(), 9))
+    os.chmod(a.out / "units.bin", 0o644)
+    print(f"units.bin {(a.out / 'units.bin').stat().st_size / 1e3:.0f} kB, "
+          f"{len(units_out)} split tests")
     print(f"files.bin {len(blobs) / 1e6:.2f} MB, meta.json "
           f"{(a.out / 'meta.json').stat().st_size / 1e3:.0f} kB, {len(index)} files, "
           f"{len(problems)} problems")

@@ -21,6 +21,9 @@ docker build -f dev/Dockerfile -t br-dev .
 | `import_closure.py` | Inside br-dev: one fresh interpreter per test file, recording which project modules that file imports at collection time. |
 | `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
 | `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
+| `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. |
+| `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Evaluation only. |
+| `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. Evaluation only. |
 
 Typical loop:
 
@@ -33,6 +36,23 @@ python3 tools/eval.py --data work/synth --answers work/synth/answers.json --imag
 # or without docker (the selector reads $BR_DATA and finds ../maps itself):
 python3 tools/eval.py --data work/synth --answers work/synth/answers.json --cmd "python3 app/main.py"
 ```
+
+Phase 4 loop (verification):
+
+```sh
+docker build -t br-sub .                       # the submission image (has /opt/sqlglot + .pyc)
+tools/make_maps.sh                             # also traces split-test units -> maps/units.bin
+docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub \
+    python /w/tools/measure_vcpu.py --tests /w/sample/tests.json --out /out/vcpu.json
+cp work/vcpu.json maps/vcpu.json
+docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub python /w/tools/verify_eval.py \
+    --data /w/work/synth --answers /w/work/synth/answers.json --out /out/synth_verify.jsonl --parallel 10
+python3 tools/sim_verify.py --data work/synth --verify work/synth_verify.jsonl -v
+docker build -t blast-radius-entry . && python3 tools/eval.py --data work/holdout \
+    --answers work/holdout/answers.json --image blast-radius-entry --env BR_BUDGET_CAP=2000
+```
+
+Measure CPU in the submission image, not br-dev: br-dev has no `.pyc`, so imports are 3–4× slower.
 
 Evaluation sets in `work/`: `synth` (300, seed 1, used for tuning), `edge` (12), and `holdout` (200, seed 2, `--test-code-frac 0.1`, **never tuned on**; use it to confirm a change, not to design one).
 
