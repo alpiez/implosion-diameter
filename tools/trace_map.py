@@ -129,8 +129,8 @@ def audit(event, args):
         if not p.startswith(ROOT_PREFIX):
             return
         r = p[len(ROOT_PREFIX):]
-        if r.endswith((".pyc", ".py")) and event == "open":
-            return
+        if event == "open" and (r.endswith(".pyc") or (r.endswith(".py") and STATE["mode"] != "test")):
+            return  # .py opened during a test = read as text (e.g. tests/test_typing.py:60)
         if event != "open":
             r += "/"  # directory listing
         if STATE["mode"] == "test":

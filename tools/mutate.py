@@ -208,18 +208,23 @@ def main() -> None:
     ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--prefix", default="s")
+    ap.add_argument("--test-code-frac", type=float, default=0.0,
+                    help="fraction of code mutants placed in tests/**/*.py instead of sqlglot/")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     random.seed(a.seed)
 
     py = sorted(str(p.relative_to(a.src)) for p in (a.src / "sqlglot").rglob("*.py"))
+    test_py = sorted(str(r) for r in (p.relative_to(a.src) for p in (a.src / "tests").rglob("*.py"))
+                     if "fixtures" not in r.parts and r.name not in ("gen_fixtures.py", "leakcheck.py")
+                     and "sqlglot" not in r.parts[1:])
     fx_opt = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures/optimizer").glob("*.sql"))
     fx_other = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures").glob("*.sql"))
 
     def one(kind):
         for _ in range(50):
             if kind == "code":
-                rel = rng.choice(py)
+                rel = rng.choice(test_py if rng.random() < a.test_code_frac else py)
                 new = mutate_code(a.src, rel, rng)
             elif kind == "comment":
                 rel = rng.choice(py)

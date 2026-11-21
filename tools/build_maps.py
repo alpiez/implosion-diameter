@@ -15,8 +15,11 @@ structure). Input: the trace dir (meta.json + tests/<n>.json). Output:
   maps/files.bin   one zlib(JSON) blob per source file (sqlglot/**.py, tests/**.py):
       cov            {line: set}  tests that executed the line at runtime
       imp            {line: [module files]}  modules whose import executed the line
-      struct         [[start, end, kind, qualname, col, end_col], ...]  kind: c/f/l
-                     (class, def, lambda); columns only matter for lambdas
+      struct         [[start, end, kind, qualname, col, end_col, body_start], ...]
+                     kind: c/f/l (class, def, lambda); start includes decorators;
+                     body_start = first line of the body (lines before it are the header,
+                     evaluated in the enclosing scope); columns only matter for lambdas
+      strings        [[start, end, is_docstring], ...] string literals spanning lines
       any            set: tests that executed any line of this file at runtime
       class_users    {qualname: set}  tests whose used classes include this class in
                      their MRO (i.e. used it or a subclass)
@@ -75,22 +78,58 @@ def structure(path: Path) -> list:
             if isinstance(child, ast.ClassDef):
                 q = prefix + child.name
                 start = min([d.lineno for d in child.decorator_list] + [child.lineno])
-                out.append([start, child.end_lineno, "c", q, 0, 0])
+                out.append([start, child.end_lineno, "c", q, 0, 0, child.body[0].lineno])
                 visit(child, q + ".")
             elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 q = prefix + child.name
                 start = min([d.lineno for d in child.decorator_list] + [child.lineno])
-                out.append([start, child.end_lineno, "f", q, 0, 0])
+                out.append([start, child.end_lineno, "f", q, 0, 0, child.body[0].lineno])
                 visit(child, q + ".<locals>.")
             elif isinstance(child, ast.Lambda):
                 out.append([child.lineno, child.end_lineno, "l", prefix + "<lambda>",
-                            child.col_offset, child.end_col_offset])
+                            child.col_offset, child.end_col_offset, child.body.lineno])
                 visit(child, prefix)
             else:
                 visit(child, prefix)
 
     visit(tree, "")
     return out
+
+
+def multiline_strings(path: Path) -> list:
+    """[start, end, is_docstring] of string literals (incl. f-strings) spanning lines."""
+    try:
+        tree = ast.parse(path.read_text(), str(path))
+    except SyntaxError:
+        return []
+    docs = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docs.add(id(body[0].value))
+    out = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes))) \
+                or isinstance(node, ast.JoinedStr):
+            if node.end_lineno > node.lineno:
+                out.append([node.lineno, node.end_lineno, int(id(node) in docs)])
+    return sorted(out)
+
+
+def mro(key: str, classes: dict, memo: dict) -> list:
+    """Approximate MRO (all sqlglot ancestors) of a class key from the class table."""
+    if key in memo:
+        return memo[key]
+    memo[key] = [key]
+    seen = [key]
+    for b in classes.get(key, {}).get("bases", []):
+        for k in mro(b, classes, memo):
+            if k not in seen:
+                seen.append(k)
+    memo[key] = seen
+    return seen
 
 
 def multiline_statements(path: Path) -> list:
@@ -158,6 +197,18 @@ def main() -> None:
         for m, fl in d.get("lazy_imports", {}).items():
             for f, lines in fl.items():
                 lazy[m][f].update(lines)
+
+    # Dialect composition: the _Dialect metaclass reads the tokenizer/parser/generator
+    # classes' attributes when a dialect is created (QUOTE_START, TRANSFORMS pruning, ...),
+    # so users of a dialect are users of its parts and of the parts' ancestors.
+    memo = {}
+    for d, parts in meta.get("dialects", {}).items():
+        dbits = class_bits.get(d, 0)
+        if not dbits:
+            continue
+        for part in parts.values():
+            for k in mro(part, meta["classes"], memo):
+                class_bits[k] |= dbits
 
     # import contexts: file -> line -> modules whose import executed it
     imp: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
@@ -255,6 +306,7 @@ def main() -> None:
             "file_tests": st.add(file_test_bits.get(f, 0)),
             "collect_users": st.add(collect_bits.get(f, 0)),
             "stmts": multiline_statements(ROOT / f),
+            "strings": multiline_strings(ROOT / f),
         }
         payload["sets"] = st.items
         blob = zlib.compress(json.dumps(payload, separators=(",", ":")).encode(), 9)

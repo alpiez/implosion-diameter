@@ -1,0 +1,4 @@
+*
+!app/
+!maps/
+app/__pycache__

@@ -30,6 +30,10 @@ tools/run_oracle.sh work/synth/commits sample/tests.json --jobs 4 --workers 4 > 
 python3 tools/labels.py work/synth/labels.jsonl sample/tests.json --kinds work/synth/kinds.json > work/synth/answers.json
 cp sample/tests.json work/synth/
 python3 tools/eval.py --data work/synth --answers work/synth/answers.json --image blast-radius-entry -v
+# or without docker (the selector reads $BR_DATA and finds ../maps itself):
+python3 tools/eval.py --data work/synth --answers work/synth/answers.json --cmd "python3 app/main.py"
 ```
+
+Evaluation sets in `work/`: `synth` (300, seed 1, used for tuning), `edge` (12), and `holdout` (200, seed 2, `--test-code-frac 0.1`, **never tuned on**; use it to confirm a change, not to design one).
 
 `work/` is gitignored. `work/sqlglot` is a copy of the pinned checkout, taken from the image.
