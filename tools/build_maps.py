@@ -331,8 +331,8 @@ def main() -> None:
         os.chmod(p, 0o644)
 
     # per-unit coverage of split tests (app/verify.py SPLITS), from trace/units/<test>_<unit>.json:
-    # units.bin = zlib(json {test id: {"n", "ok", "cpu": [traced cpu per unit],
-    #                                  "lines": {file: {line: hex bitset over units}}}})
+    # units.bin = zlib(json {test id: {"n", "ok", "lines": {file: {line: hex bitset over units}}}})
+    # (no timings here, so the maps stay byte-identical; unit CPU is in vcpu.json)
     udir = a.trace / "units"
     units_out = {}
     if udir.is_dir():
@@ -352,7 +352,6 @@ def main() -> None:
                         ul[f][ln] |= 1 << u
             units_out[tests[ti]] = {
                 "n": nunits, "ok": ok,
-                "cpu": [us.get(u, {}).get("cpu", 0) for u in range(nunits)],
                 "lines": {f: {str(ln): format(bits, "x") for ln, bits in sorted(d.items())}
                           for f, d in sorted(ul.items())},
             }
