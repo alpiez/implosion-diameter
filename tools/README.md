@@ -15,6 +15,12 @@ docker build -f dev/Dockerfile -t br-dev .
 | `labels.py` | Oracle JSON lines to `answers.json` format (test numbers). |
 | `eval.py` | Scores a selector on labelled patches: `--image` (scorer flags, CPU measured inside the container via `cpuwrap.py`), `--cmd` (local, reads `$BR_DATA`), or `--output`. |
 | `mutate.py` | Synthetic patches in the sample's styles. **Local evaluation only, never shipped or used as a lookup table.** |
+| `edge.py` | Hand-made edge-case patches (evaluation only). |
+| `make_maps.sh` | **Regenerates `maps/` from the pinned commit only**: runs `trace_map.py`, then `import_closure.py`, then `build_maps.py`. About 1 min, byte-identical output. |
+| `trace_map.py` | Inside br-dev: a fork-per-test tracer (`sys.monitoring`). Records each test's lines, classes used, files opened and subprocess use, plus per-module import contexts, the import graph and the class table. |
+| `import_closure.py` | Inside br-dev: one fresh interpreter per test file, recording which project modules that file imports at collection time. |
+| `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
+| `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
 
 Typical loop:
 
