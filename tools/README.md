@@ -22,6 +22,7 @@ docker build -f dev/Dockerfile -t br-dev .
 | `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
 | `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
 | `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. |
+| `preload_list.py` | **Regenerates `maps/preload.json`**: the standard-library modules sqlglot and its tests import (fresh interpreter, submission image). The verifier imports them once before forking. Pinned commit only. |
 | `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Evaluation only. |
 | `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. Evaluation only. |
 
@@ -45,6 +46,7 @@ tools/make_maps.sh                             # also traces split-test units ->
 docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub \
     python /w/tools/measure_vcpu.py --tests /w/sample/tests.json --out /out/vcpu.json
 cp work/vcpu.json maps/vcpu.json
+docker run --rm -v "$PWD":/w:ro -v "$PWD/maps":/maps br-sub python /w/tools/preload_list.py --out /maps/preload.json
 docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub python /w/tools/verify_eval.py \
     --data /w/work/synth --answers /w/work/synth/answers.json --out /out/synth_verify.jsonl --parallel 10
 python3 tools/sim_verify.py --data work/synth --verify work/synth_verify.jsonl -v

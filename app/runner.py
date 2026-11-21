@@ -346,7 +346,11 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
     if sys.flags.no_site:
         import site
         site.main()  # main.py runs with -S; the tests need site-packages
-    v = verify.Verifier(parallel=PARALLEL)
+    try:
+        preload = json.loads((blast.MAPS / "preload.json").read_text())
+    except Exception:  # noqa: BLE001
+        preload = []
+    v = verify.Verifier(parallel=PARALLEL, preload=preload)
     budget = min(BUDGET_CAP_S, BUDGET_PER_COMMIT_S * n_commits)
     deadline = T_START + budget
     jobs = [p[2] for p in plans]
@@ -359,6 +363,6 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
                  {num_by_id[t] for t in job.failed if t in num_by_id}
         out[commit] = passed
         log(f"{commit}: verified {len(job.tests)} -> passed {len(passed)}, failed {len(job.failed)}, "
-            f"cpu {job.child_cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")
+            f"cpu {job.child_cpu:.2f}s tests {job.cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")
     log(f"verification cpu {v.cpu_children:.1f}s")
     return out

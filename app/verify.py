@@ -398,7 +398,7 @@ class Job:
 
 
 class Verifier:
-    def __init__(self, parallel: int = 2, gap_timeout: float = 30.0):
+    def __init__(self, parallel: int = 2, gap_timeout: float = 30.0, preload: list | None = None):
         self.parallel = parallel
         self.gap_timeout = gap_timeout
         self.heavy_loaded = False
@@ -411,7 +411,15 @@ class Verifier:
         os.environ.setdefault("PYTHON_CPU_COUNT", "2")
         import unittest  # noqa: F401 - must precede sqlglot (sqlglot.expressions.core.UNITTEST)
         import concurrent.futures  # noqa: F401
+        import importlib
         import pickle as _p  # noqa: F401
+        # standard-library modules sqlglot and its tests import (maps/preload.json): imported
+        # once here instead of in every child. They are never patched.
+        for name in preload or ():
+            try:
+                importlib.import_module(name)
+            except Exception:  # noqa: BLE001
+                pass
 
     def preload_heavy(self) -> None:
         if not self.heavy_loaded:
@@ -431,6 +439,8 @@ class Verifier:
             job.root = TMP / str(self.n)
             build_overlay(job.root, job.changes)
         r, w = os.pipe()
+        import gc
+        gc.freeze()  # preloaded objects: not rescanned by every child's GC, fewer copy-on-write faults
         tests = [(i, job.tests[i][0], job.tests[i][2] if len(job.tests[i]) > 2 else None)
                  for i in job.todo]
         pid = os.fork()
@@ -488,7 +498,7 @@ class Verifier:
 
     def _lines(self, job: Job) -> bool:
         """Process complete lines; True if the child said it is done."""
-        while b"\n" in job.buf:
+        while b"\n" in job.buf and not job.stopped:  # after a stop, ignore the rest (deterministic)
             line, job.buf = job.buf.split(b"\n", 1)
             parts = line.decode().split()
             if not parts:
@@ -547,6 +557,13 @@ class Verifier:
 
     def run(self, jobs: list[Job], deadline: float) -> None:
         """Run jobs (in order) until all are done or the wall-clock deadline passes."""
+        try:
+            self._run(jobs, deadline)
+        finally:
+            import gc
+            gc.unfreeze()  # let the main process free everything normally at exit
+
+    def _run(self, jobs: list[Job], deadline: float) -> None:
         if any(t[0].startswith(HEAVY) for j in jobs for t in j.tests):
             self.preload_heavy()
         queue = list(jobs)

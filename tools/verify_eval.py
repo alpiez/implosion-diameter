@@ -34,7 +34,8 @@ def main() -> None:
     ap.add_argument("--max-sum", type=float, default=1e9, help="skip commits whose S sums above this (s)")
     a = ap.parse_args()
 
-    v = verify.Verifier(parallel=a.parallel, gap_timeout=120)
+    preload = json.loads((ROOT / "maps" / "preload.json").read_text())  # as at runtime
+    v = verify.Verifier(parallel=a.parallel, gap_timeout=120, preload=preload)
     tests = json.loads((a.data / "tests.json").read_text())["tests"]
     num = {t["id"]: t["number"] for t in tests}
     by_num = {t["number"]: t for t in tests}

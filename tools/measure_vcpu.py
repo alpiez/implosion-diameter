@@ -36,7 +36,8 @@ def main() -> None:
         by_file.setdefault(t["id"].split("::")[0], []).append((t["id"], max(30.0, 5 * t["seconds"] + 10)))
     noop = {"sqlglot/py.typed": (verify.SRC / "sqlglot/py.typed").read_text()
             if (verify.SRC / "sqlglot/py.typed").exists() else ""}
-    v = verify.Verifier(parallel=a.parallel, gap_timeout=120)
+    preload = json.loads((ROOT / "maps" / "preload.json").read_text())  # as at runtime
+    v = verify.Verifier(parallel=a.parallel, gap_timeout=120, preload=preload)
     cpu: dict[str, list] = {}
     ovh: dict[str, list] = {}
     failed = set()
