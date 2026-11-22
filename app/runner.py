@@ -363,6 +363,21 @@ class Units:
                     and all(x is not None for x in c)):
                 self.tests[tid] = (index[tid], d, c)
 
+    def subset(self, tid: str, units):
+        """(unit indices, cpu) for a given unit list; [] means the cheapest unit (smoke run)."""
+        if tid not in self.tests:
+            return None
+        _, d, ucpu = self.tests[tid]
+        if units is None or any(not 0 <= u < d["n"] for u in units):
+            return None
+        if not units:
+            units = [min(range(d["n"]), key=lambda u: (ucpu[u], u))]
+        units = sorted(set(units))
+        if len(units) == d["n"]:
+            return None
+        whole = float(self.whole.get(tid, sum(ucpu)))
+        return units, whole * sum(ucpu[u] for u in units) / max(sum(ucpu), 1e-9)
+
     def reachable(self, tid: str, noncov: int, covlines: list):
         """(unit indices, cpu) for this commit, or None when the whole test must run."""
         if tid not in self.tests:
@@ -436,17 +451,77 @@ class Planner:
             lim[-1] += 2.0 + 0.1 * len(lim)  # the result comparisons after the last unit
         return lim
 
-    def plan(self, S: list[int], files: list, info) -> tuple[int, list, dict, dict]:
+    def plan(self, S: list[int], files: list, info, fixture_units: dict | None = None
+             ) -> tuple[int, list, dict, dict]:
         """(expected gain ms, V, cpu estimates, {number: unit indices})."""
         ccpu, cunits = self.cpu, {}
         for n in self.split_nums.keys() & set(S):
-            r = self.units.reachable(self.split_nums[n], *(info or (-1, []))[:2])
+            tid = self.split_nums[n]
+            if fixture_units and tid in fixture_units:
+                r = self.units.subset(tid, fixture_units[tid])
+            else:
+                r = self.units.reachable(tid, *(info or (-1, []))[:2])
             if r is not None:
                 if ccpu is self.cpu:
                     ccpu = dict(self.cpu)
                 cunits[n], ccpu[n] = r
         gain, V = plan_commit(S, self.dur, ccpu, self.file_ovh, self.file_of, prior_q(files))
         return gain, sorted(V), ccpu, cunits
+
+
+# Phase 6g: split tests whose units are the entries of one SQL fixture (verify.SPLITS "cls"
+# lists, filled by setUpClass from tests/helpers.load_sql_fixture_pairs)
+FIXTURE_SPLITS = {
+    "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql":
+        ("tests/test_executor.py::TestExecutor::test_execute_tpcds",),
+    "tests/fixtures/optimizer/tpc-h/tpc-h.sql":
+        ("tests/test_executor.py::TestExecutor::test_execute_tpch",
+         "tests/test_executor.py::TestExecutor::test_optimized_tpch"),
+}
+
+
+def _fixture_pairs(text: str) -> list:
+    """tests/helpers.py load_sql_fixture_pairs at the pinned commit, on a string (it raises
+    where the original raises, e.g. on a '#' line without ':')."""
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("--")]
+    statements = "\n".join(lines).split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql_lines = statements[i].strip().split("\n")
+            meta, k = {}, 0
+            while sql_lines[k].startswith("#"):
+                key, val = sql_lines[k].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                k += 1
+            out.append((meta, "\n".join(sql_lines[k:]), statements[i + 1].strip()))
+    return out
+
+
+def fixture_units(changes: dict, src) -> dict:
+    """{split test id: unit indices that can behave differently} for a patch that changes only
+    the TPC fixture SQL files: a unit's behaviour depends on its own (meta, sql, expected)
+    entry, so only changed entries need to run; [] = no entry of its file changed (run the
+    cheapest unit, which still runs setUpClass on the patched tree). Anything unusual (other
+    files, a different entry count, a loader error) gives {} and the whole tests run."""
+    if not changes or any(p not in FIXTURE_SPLITS or t is None for p, t in changes.items()):
+        return {}
+    out = {}
+    try:
+        parsed = {}
+        for path in FIXTURE_SPLITS:
+            orig = (src / path).read_text(encoding="utf-8")
+            new = changes.get(path, orig)
+            parsed[path] = (_fixture_pairs(orig), _fixture_pairs(new))
+    except Exception:  # noqa: BLE001 - setUpClass would fail too: run the whole tests
+        return {}
+    for path, (a, b) in parsed.items():
+        if len(a) != len(b):
+            continue
+        units = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        for tid in FIXTURE_SPLITS[path]:
+            out[tid] = units
+    return out
 
 
 def module_name(f: str) -> str:
@@ -481,7 +556,9 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             exec_ok = cache_ok and exec_cache.guard_ok(
                 [q for fc in files for q in (fc.old, fc.new) if q is not None])
             pl = planner if exec_ok else planner.without_cache()
-            gain, V, ccpu, cunits = pl.plan(S, files, inf) if S else (0, [], {}, {})
+            changes = verify.patched_files(files)
+            fu = fixture_units(changes, verify.SRC)
+            gain, V, ccpu, cunits = pl.plan(S, files, inf, fu) if S else (0, [], {}, {})
             if gain < MARGIN_MS or not V:
                 gain, V = 0, []
             E, D = [], []
@@ -494,7 +571,6 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
                     V = sorted(set(V) | set(E))
             if not V and commit not in probes:
                 continue  # (else: import probe only)
-            changes = verify.patched_files(files)
         except Exception as e:  # noqa: BLE001
             log(f"{commit}: not verifiable ({e})")
             continue

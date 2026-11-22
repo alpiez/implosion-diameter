@@ -24,15 +24,23 @@ from pathlib import Path
 CACHE = Path(__file__).resolve().parent / "cache" / "executor.pkl"
 DATASETS = (("tpch", "DIR_TPCH", "TPCH_SCHEMA", "tpch_conn", "tpch_tables"),
             ("tpcds", "DIR_TPCDS", "TPCDS_SCHEMA", "tpcds_conn", "tpcds_tables"))
-# a patch touching any of these disables the caches for that commit
+# a patch touching any of these disables the caches for that commit; the fixture SQL files
+# (tpc-h.sql, tpc-ds.sql) do not: the rows come from the CSVs only, the DuckDB results are keyed
+# by the exact SQL string, and the cached setUpClass reads the queries from the patched tree
 GUARDED = ("tests/test_executor.py", "tests/helpers.py",
            "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+
+
+def _guarded(p: str) -> bool:
+    if p.startswith(GUARDED[2:]) and p.endswith(".sql"):
+        return False
+    return p.startswith(GUARDED)
 
 DATA: dict | None = None  # loaded once in the fork server, inherited by the children
 
 
 def guard_ok(paths) -> bool:
-    return not any(p and p.startswith(GUARDED) for p in paths)
+    return not any(p and _guarded(p) for p in paths)
 
 
 def _path() -> Path:
