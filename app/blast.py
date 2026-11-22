@@ -378,12 +378,48 @@ def changed_columns(block: Block, ln: int):
 
 # ------------------------------------------------------------------------- selection
 
+ASSIGN_START = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*(?::[^=]*)?=(?!=)")
+
+
+def _entry_key(line: str) -> str | None:
+    """Text before the first ':' at bracket depth 0 outside strings (a dict entry's key)."""
+    depth = 0
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if line.startswith(quote, i):
+                i += len(quote)
+                quote = None
+                continue
+        elif ch in "\"'":
+            quote = line[i:i + 3] if line[i:i + 3] in ('"""', "'''") else ch
+            i += len(quote)
+            continue
+        elif ch == "#":
+            return None
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            return line[:i].strip()
+        i += 1
+    return None
+
+
 class Selector:
     def __init__(self, maps: Maps):
         self.m = maps
         self.core = set(maps.meta.get("core_modules", []))
         self.noncov = 0                           # tests selected NOT via runtime coverage
         self.covlines: list[tuple[str, int]] = []  # (file, line) whose coverage was used
+        self.use_attrs = True                     # phase 5a attribute rule (needs an import probe)
+        self.attr_files: list[str] = []           # files where the attribute rule was used
 
     # ---- users of a module: tests that executed it or used a class defined in it
     def mod_users(self, f: str, with_importers: bool = True) -> int:
@@ -505,6 +541,51 @@ class Selector:
         self.noncov |= nc
         return bits | nc
 
+    def attr_block(self, f: str, p: dict, block: Block) -> int | None:
+        """Phase 5a: an edit confined to one UPPER_CASE class attribute (maps "attrs").
+        Key level when only values of existing table entries change; attribute level for
+        other edits inside the statement. None = not applicable (use the line rules)."""
+        attrs = p.get("attrs")
+        if not attrs:
+            return None
+        lines = [ln for ln, _ in block.removed] or [block.old_start - 1, block.old_start]
+        ents = [attrs.get(str(ln)) for ln in lines]
+        if any(e is None for e in ents) or len({e[3] for e in ents}) != 1:
+            return None
+        s0 = ents[0][3]
+        for st in p["struct"]:  # edits inside a lambda body are runtime: line rules
+            if st[2] == "l" and any(st[0] <= ln <= st[1] for ln in lines):
+                return None
+        removed = [t for _, t in block.removed]
+        added = block.added
+        if not removed and any(ASSIGN_START.match(t) for t in added):
+            return None  # a new attribute
+        if s0 in lines and block.removed:  # the target line itself: the name must not change
+            i = lines.index(s0)
+            m_old = ASSIGN_START.match(removed[i])
+            m_new = ASSIGN_START.match(added[i]) if i < len(added) else None
+            if not m_old or not m_new or m_old.group(1) != m_new.group(1):
+                return None
+        bits = 0
+        cov = p["cov"]
+        for ln in lines:
+            si = cov.get(str(ln))
+            if si is not None:
+                bits |= self.m.s(p, si)
+        key_ok = bool(removed) and len(removed) == len(added) and all(e[0] >= 0 for e in ents)
+        if key_ok:
+            for e, old, new in zip(ents, removed, added):
+                if e[2] and _entry_key(old) != _entry_key(new):
+                    key_ok = False
+                    break
+        if key_ok:
+            for e in ents:
+                bits |= self.m.s(p, e[0])
+            return bits
+        if ents[0][1] < 0:
+            return None
+        return bits | self.m.s(p, ents[0][1])
+
     def python_file(self, fc: FileChange, why: list) -> int:
         f = fc.old
         p = self.m.file(f)
@@ -522,6 +603,14 @@ class Selector:
             return r
         for block in fc.blocks:
             if non_semantic(p, block):
+                continue
+            ab = self.attr_block(f, p, block) if self.use_attrs else None
+            if ab is not None:
+                bits |= ab
+                self.noncov |= ab
+                if f not in self.attr_files:
+                    self.attr_files.append(f)
+                why.append(f"{f}@{block.old_start}: class attribute -> {bin(ab).count('1')}")
                 continue
             for ln in sorted(self.affected_lines(p, block)):
                 b = self.python_line(f, p, ln, block)
@@ -548,6 +637,7 @@ class Selector:
     def select(self, text: str, why: list) -> int:
         self.noncov = 0
         self.covlines = []
+        self.attr_files = []
         return self._select(text, why)
 
     def _select(self, text: str, why: list) -> int:

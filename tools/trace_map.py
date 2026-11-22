@@ -57,6 +57,14 @@ TEST_FILES: set[str] = set()
 IMPORT_FILES: dict[str, set[str]] = {}
 USED_CLASSES: set[type] = set()
 FLAGS: dict[str, bool] = {"subprocess": False}
+# phase 5a: class-attribute reads per test (Dialect/Tokenizer/Parser/Generator families)
+ATTR_READS: set[str] = set()   # "module:Qual.NAME" read (any access)
+KEY_READS: set[str] = set()    # "module:Qual.NAME|keyid" looked up (hit or miss)
+WHOLE_READS: set[str] = set()  # "module:Qual.NAME" iterated / copied / sized
+# reads made while modules are imported, by functions or module-level code (class bodies are
+# analysed statically by build_maps): these values are consumed at import time
+IMPORT_ATTR: set[str] = set()
+IMPORT_KEYS: set[str] = set()
 
 _rel_cache: dict[str, str | None] = {}
 
@@ -261,6 +269,182 @@ def mro_keys(classes: set[type]) -> list[str]:
     return sorted(keys)
 
 
+# ----------------------------------------------------------------- attribute reads (5a)
+
+UPPER = __import__("re").compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+_COMPREHENSIONS = ("<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>", "<lambda>")
+
+
+def _import_reader_counts() -> bool:
+    """While importing: is the code reading the attribute a function or module-level code
+    (consumption) rather than a class body (merges and derivations, handled statically)?"""
+    f = sys._getframe(2)
+    while f is not None and (f.f_code.co_filename == __file__ or f.f_code.co_name in _COMPREHENSIONS[:4]):
+        f = f.f_back
+    if f is None:
+        return True
+    code = f.f_code
+    return code.co_name == "<module>" or bool(code.co_flags & 0x1)  # CO_OPTIMIZED: a function
+
+
+def key_id(k) -> str:
+    import enum
+    if isinstance(k, str):
+        return "s:" + k
+    if isinstance(k, enum.Enum):
+        return f"e:{type(k).__qualname__}.{k.name}"
+    if isinstance(k, type):
+        return f"t:{k.__module__}.{k.__qualname__}"
+    return "r:" + repr(k)[:100]
+
+
+class TrackDict(dict):
+    """A class-level table that records which keys a test looks up (or whether it scans it)."""
+    __slots__ = ("_k",)
+
+    def _key(self, key):
+        mode = STATE["mode"]
+        if mode == "test":
+            try:
+                KEY_READS.add(self._k + "|" + key_id(key))
+            except Exception:  # noqa: BLE001
+                WHOLE_READS.add(self._k)
+        elif mode == "import" and _import_reader_counts():
+            try:
+                IMPORT_KEYS.add(self._k + "|" + key_id(key))
+            except Exception:  # noqa: BLE001
+                IMPORT_ATTR.add(self._k)
+
+    def _whole(self):
+        mode = STATE["mode"]
+        if mode == "test":
+            WHOLE_READS.add(self._k)
+        elif mode == "import" and _import_reader_counts():
+            IMPORT_ATTR.add(self._k)
+
+    def __getitem__(self, key):
+        self._key(key)
+        return dict.__getitem__(self, key)
+
+    def get(self, key, default=None):
+        self._key(key)
+        return dict.get(self, key, default)
+
+    def __contains__(self, key):
+        self._key(key)
+        return dict.__contains__(self, key)
+
+    def pop(self, key, *a):
+        self._key(key)
+        return dict.pop(self, key, *a)
+
+    def setdefault(self, key, default=None):
+        self._key(key)
+        return dict.setdefault(self, key, default)
+
+    def __iter__(self):
+        self._whole()
+        return dict.__iter__(self)
+
+    def keys(self):
+        self._whole()
+        return dict.keys(self)
+
+    def items(self):
+        self._whole()
+        return dict.items(self)
+
+    def values(self):
+        self._whole()
+        return dict.values(self)
+
+    def __len__(self):
+        self._whole()
+        return dict.__len__(self)
+
+    def copy(self):
+        self._whole()
+        return dict(dict.items(self))
+
+    def __or__(self, other):
+        self._whole()
+        return dict(dict.items(self)) | other
+
+    def __ror__(self, other):
+        self._whole()
+        return other | dict(dict.items(self))
+
+    def __eq__(self, other):
+        self._whole()
+        return dict.__eq__(self, other)
+
+    __hash__ = None
+
+
+class TrackedAttr:
+    """Non-data descriptor standing in for a class attribute: records the read, returns the value."""
+    __slots__ = ("v", "k")
+
+    def __init__(self, v, k):
+        self.v = v
+        self.k = k
+
+    def __get__(self, obj, typ=None):
+        mode = STATE["mode"]
+        if mode == "test":
+            ATTR_READS.add(self.k)
+        elif mode == "import" and not isinstance(self.v, TrackDict) and _import_reader_counts():
+            IMPORT_ATTR.add(self.k)  # scalars; tables record their own key or whole reads
+        return self.v
+
+
+_SHARED: dict[int, object] = {}
+
+
+def install_attr_tracking(tracked_classes=None) -> int:
+    """Replace UPPER_CASE data attributes of the parser/generator/tokenizer/dialect families
+    by recording descriptors (dict tables become TrackDicts). Shared objects stay shared."""
+    import types
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.generator import Generator
+    from sqlglot.parser import Parser
+    from sqlglot.tokens import Tokenizer
+    roots = [Dialect, Generator, Parser, Tokenizer]
+    try:
+        from sqlglot.jsonpath import JSONPathTokenizer
+        roots.append(JSONPathTokenizer)
+    except Exception:  # noqa: BLE001
+        pass
+    fam = set()
+    for r in roots:
+        fam.add(r)
+        fam |= all_subclasses(r)
+    for c in list(fam):
+        fam.update(b for b in c.__mro__ if b.__module__.startswith("sqlglot"))
+    shared = _SHARED
+    n = 0
+    for c in sorted(fam, key=class_key):
+        for name, v in list(vars(c).items()):
+            if not UPPER.match(name) or isinstance(v, (type, types.FunctionType, classmethod,
+                                                      staticmethod, property, TrackedAttr)):
+                continue
+            k = f"{class_key(c)}.{name}"
+            if isinstance(v, dict) and type(v) is dict:
+                entry = shared.get(id(v))
+                if entry is not None and entry[0] is v:
+                    td = entry[1]
+                else:
+                    td = TrackDict(v)
+                    td._k = k
+                    shared[id(v)] = (v, td)  # keep the original alive: ids must not be reused
+                v = td
+            setattr(c, name, TrackedAttr(v, k))
+            n += 1
+    return n
+
+
 # ----------------------------------------------------------------- running a test
 
 class Result:
@@ -324,6 +508,9 @@ def run_one(tid: str, out: Path, timeout: int, units: list | None = None) -> Non
         "cpu": round(time.process_time() - c0, 3),
         "lines": {f: sorted(s) for f, s in sorted(TEST_LINES.items())},
         "classes": mro_keys(USED_CLASSES),
+        "attr_reads": sorted(ATTR_READS),
+        "key_reads": sorted(KEY_READS),
+        "whole_reads": sorted(WHOLE_READS),
         "files": sorted(TEST_FILES),
         "subprocess": FLAGS["subprocess"],
         # the child starts with IMPORT_LINES empty, so anything here was imported lazily
@@ -365,6 +552,9 @@ def main() -> None:
     before = set(sys.modules)
     import sqlglot  # noqa: F401
     core_modules = sorted(m for m in set(sys.modules) - before if m.startswith("sqlglot"))
+    ATTRS = os.environ.get("BR_ATTRS", "1") != "0"
+    if ATTRS:
+        install_attr_tracking()  # from here on, import-time reads by functions are recorded
 
     # 2. every sqlglot module, then every test module
     import importlib
@@ -377,6 +567,8 @@ def main() -> None:
             importlib.import_module(info.name)
         except Exception as e:  # noqa: BLE001
             failed_imports[info.name] = repr(e)[:300]
+        if ATTRS:
+            install_attr_tracking()  # classes this module created
     test_mods = sorted({t.split("::")[0][:-3].replace("/", ".") for t in tests})
     for extra in sorted(Path(ROOT, "tests").rglob("*.py")):
         name = str(extra.relative_to(ROOT))[:-3].replace("/", ".")
@@ -389,6 +581,8 @@ def main() -> None:
             importlib.import_module(m)
         except Exception as e:  # noqa: BLE001
             failed_imports[m] = repr(e)[:300]
+        if ATTRS:
+            install_attr_tracking()
     STATE["mode"] = "idle"
     STATE["stack"].clear()
     import_secs = time.perf_counter() - t0
@@ -398,6 +592,10 @@ def main() -> None:
         if m in sys.modules and hasattr(sys.modules[m], "ProcessPoolExecutor"):
             sys.modules[m].ProcessPoolExecutor = InlinePool
     tracked = install_class_tracking()
+    if ATTRS:
+        install_attr_tracking()  # dynamic classes made since (none expected)
+        print(f"[trace] {len([1 for c in _SHARED])} tables, import-time reads: "
+              f"{len(IMPORT_ATTR)} attributes, {len(IMPORT_KEYS)} keys", file=sys.stderr, flush=True)
 
     # class table: every class defined in sqlglot modules (for hierarchy / subclass closure)
     classes = {}
@@ -427,11 +625,17 @@ def main() -> None:
             class_key(b) for b in c.__bases__}
     from sqlglot.dialects.dialect import Dialect
     dialects = {}
+    # each dialect's parts and their REAL ancestry (from the live classes, not from the class
+    # table: dynamic parts made by the metaclass share one key, so their table bases merge)
+    dialect_mros: dict[str, set[str]] = {}
     for d in [Dialect, *all_subclasses(Dialect)]:
-        dialects[class_key(d)] = {
-            part: class_key(getattr(d, part)) for part in
-            ("tokenizer_class", "jsonpath_tokenizer_class", "parser_class", "generator_class")
-            if isinstance(getattr(d, part, None), type)}
+        parts = {part: getattr(d, part) for part in
+                 ("tokenizer_class", "jsonpath_tokenizer_class", "parser_class", "generator_class")
+                 if isinstance(getattr(d, part, None), type)}
+        dialects[class_key(d)] = {part: class_key(c) for part, c in parts.items()}
+        acc = dialect_mros.setdefault(class_key(d), set())
+        for c in parts.values():
+            acc.update(class_key(b) for b in c.__mro__ if b.__module__.startswith("sqlglot"))
 
     meta = {
         "root": ROOT,
@@ -445,6 +649,9 @@ def main() -> None:
         "classes": {k: {"bases": sorted(v["bases"]), "file": v["file"], "line": v["line"]}
                     for k, v in sorted(classes.items())},
         "dialects": dialects,
+        "dialect_part_mros": {k: sorted(v) for k, v in sorted(dialect_mros.items())},
+        "import_attr_reads": sorted(IMPORT_ATTR),
+        "import_key_reads": sorted(IMPORT_KEYS),
         "tests": [t["id"] for t in json.loads(Path(a.tests).read_text())["tests"]],
     }
     (a.out / "meta.json").write_text(json.dumps(meta))

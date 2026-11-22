@@ -39,6 +39,7 @@ SWAPS = {
     "==": ["!="], "!=": ["=="], "<": ["<=", ">"], "<=": ["<"], ">": [">=", "<"], ">=": [">"],
     "+": ["-"], "-": ["+"], "is": ["is not", "=="], "in": ["not in"],
 }
+PROFILE = {"name": "synth"}  # --profile; "sample" changes the mix (see main)
 
 FIX_TOKENS = ["x", "1", "a", "AS", "SELECT", ",", "(", "FROM"]
 
@@ -76,6 +77,8 @@ def code_candidates(text: str):
         elif t.type == tokenize.NAME and s == "is":
             if nxt is not None and nxt.string == "not":
                 out.append((r - 1, c, nxt.end[1], "is not", "is"))
+                if PROFILE["name"] == "sample":
+                    out.append((r - 1, c, nxt.end[1], "is not", "!="))
             else:
                 for rep in SWAPS[s]:
                     out.append((r - 1, c, c2, s, rep))
@@ -107,6 +110,9 @@ def code_candidates(text: str):
 def mutate_code(src: Path, rel: str, rng: random.Random):
     text = (src / rel).read_text()
     cands = code_candidates(text)
+    if PROFILE["name"] == "sample":
+        # identity -> equality swaps are frequent in the sample (and usually equivalent)
+        cands = cands + [cnd for cnd in cands if cnd[3] in ("is", "is not") and cnd[4] in ("==", "!=")]
     # string-literal tweaks are rare in the sample: ~5% of code mutants
     is_str = lambda cnd: cnd[3][:1] in "\"'"
     if rng.random() < 0.05:
@@ -210,7 +216,11 @@ def main() -> None:
     ap.add_argument("--prefix", default="s")
     ap.add_argument("--test-code-frac", type=float, default=0.0,
                     help="fraction of code mutants placed in tests/**/*.py instead of sqlglot/")
+    ap.add_argument("--profile", choices=["synth", "sample"], default="synth",
+                    help="sample: the sample's kind mix (code 16 / fixture 8 / multi 3 / comment 3), "
+                         "mutation points uniform over the code base, more is -> == swaps")
     a = ap.parse_args()
+    PROFILE["name"] = a.profile
     rng = random.Random(a.seed)
     random.seed(a.seed)
 
@@ -221,10 +231,19 @@ def main() -> None:
     fx_opt = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures/optimizer").glob("*.sql"))
     fx_other = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures").glob("*.sql"))
 
+    weights = None
+    if a.profile == "sample":  # pick files in proportion to their mutation points
+        weights = [len(code_candidates((a.src / r).read_text())) + 1 for r in py]
+
     def one(kind):
         for _ in range(50):
             if kind == "code":
-                rel = rng.choice(test_py if rng.random() < a.test_code_frac else py)
+                if rng.random() < a.test_code_frac:
+                    rel = rng.choice(test_py)
+                elif weights:
+                    rel = rng.choices(py, weights)[0]
+                else:
+                    rel = rng.choice(py)
                 new = mutate_code(a.src, rel, rng)
             elif kind == "comment":
                 rel = rng.choice(py)
@@ -241,7 +260,8 @@ def main() -> None:
     (a.out / "commits").mkdir(parents=True, exist_ok=True)
     kinds = {}
     for i in range(a.n):
-        kind = rng.choices(["code", "fixture", "comment", "multi"], [50, 25, 10, 15])[0]
+        mix = [53, 27, 10, 10] if a.profile == "sample" else [50, 25, 10, 15]
+        kind = rng.choices(["code", "fixture", "comment", "multi"], mix)[0]
         if kind == "multi":
             parts = [one("comment")]
             for k in rng.sample(["code", "fixture", "comment", "code"], rng.choice([1, 1, 2])):

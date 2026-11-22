@@ -14,11 +14,12 @@ docker build -f dev/Dockerfile -t br-dev .
 | `oracle_plugin.py` | pytest plugin that records any failed report per nodeid (including subtests, setup and teardown), collection errors, and failure text. |
 | `labels.py` | Oracle JSON lines to `answers.json` format (test numbers). |
 | `eval.py` | Scores a selector on labelled patches: `--image` (scorer flags, CPU measured inside the container via `cpuwrap.py`), `--cmd` (local, reads `$BR_DATA`), or `--output`. |
-| `mutate.py` | Synthetic patches in the sample's styles. **Local evaluation only, never shipped or used as a lookup table.** |
+| `mutate.py` | Synthetic patches in the sample's styles (`--profile sample`: the sample's kind mix, mutation points chosen uniformly across the code base). **Local evaluation only, never shipped or used as a lookup table.** |
 | `edge.py` | Hand-made edge-case patches (evaluation only). |
 | `make_maps.sh` | **Regenerates `maps/` from the pinned commit only**: runs `trace_map.py`, then `import_closure.py`, then `build_maps.py`. About 1 min, byte-identical output. |
 | `trace_map.py` | Inside br-dev: a fork-per-test tracer (`sys.monitoring`). Records each test's lines, classes used, files opened and subprocess use, plus per-module import contexts, the import graph and the class table. |
 | `import_closure.py` | Inside br-dev: one fresh interpreter per test file, recording which project modules that file imports at collection time. |
+| `attr_maps.py` | Phase 5a, called by `build_maps.py`: per-line readers of UPPER_CASE class attributes and table entries, with import-time consumption checks (class hooks, import-time reads, class-body derivations). |
 | `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
 | `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
 | `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. |
@@ -56,6 +57,6 @@ docker build -t blast-radius-entry . && python3 tools/eval.py --data work/holdou
 
 Measure CPU in the submission image, not br-dev: br-dev has no `.pyc`, so imports are 3–4× slower.
 
-Evaluation sets in `work/`: `synth` (300, seed 1, used for tuning), `edge` (12), and `holdout` (200, seed 2, `--test-code-frac 0.1`, **never tuned on**; use it to confirm a change, not to design one).
+Evaluation sets in `work/`: `synth` (300, seed 1, used for tuning), `edge` (12), `holdout` (200, seed 2, `--test-code-frac 0.1`, **never tuned on**), and from phase 5b `calib` (300, `--profile sample --seed 3`, tuning) and `confirm` (295, `--profile sample --seed 4`, **never tuned on**: only for the 5c ship gate).
 
 `work/` is gitignored. `work/sqlglot` is a copy of the pinned checkout, taken from the image.

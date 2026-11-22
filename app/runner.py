@@ -174,6 +174,19 @@ def main() -> None:
     static: dict[str, list[int]] = {}
     texts: dict[str, str] = {}
     info: dict[str, tuple[int, list]] = {}  # commit -> (non-coverage bits, coverage lines)
+    probes: dict[str, list[str]] = {}      # commit -> modules to import-check (attribute rule)
+    wide: dict[str, list[int]] = {}        # commit -> selection without the attribute rule
+
+    def to_nums(bits: int) -> list[int]:
+        nums = set(unknown) if bits else set()
+        x = bits
+        while x:
+            low = x & -x
+            i = low.bit_length() - 1
+            if i < len(bit_num) and bit_num[i] is not None:
+                nums.add(bit_num[i])
+            x ^= low
+        return sorted(nums)
     for patch in patches:
         commit = patch.stem
         why: list[str] = []
@@ -185,15 +198,16 @@ def main() -> None:
                 texts[commit] = text
                 bits = sel.select(text, why)
                 info[commit] = (sel.noncov, sel.covlines)
-                nums = set(unknown) if bits else set()
-                x = bits
-                while x:
-                    low = x & -x
-                    i = low.bit_length() - 1
-                    if i < len(bit_num) and bit_num[i] is not None:
-                        nums.add(bit_num[i])
-                    x ^= low
-                nums = sorted(nums)
+                nums = to_nums(bits)
+                if sel.attr_files:
+                    # the attribute rule assumes the patched module still imports: keep the
+                    # wide selection for when that cannot be checked
+                    probes[commit] = [module_name(f) for f in sel.attr_files]
+                    sel.use_attrs = False
+                    try:
+                        wide[commit] = to_nums(sel.select(text, []))
+                    finally:
+                        sel.use_attrs = True
         except Exception as e:  # noqa: BLE001
             why.append(f"error {e!r} -> all")
             nums = all_numbers
@@ -202,14 +216,24 @@ def main() -> None:
 
     # ---- 2.-3. verification
     final = dict(static)
+    verified: dict = {}
     if os.environ.get("BR_VERIFY", "1") != "0" and patches:
         try:
             verified = verify_commits(static, texts, dur, id_of, num_by_id, len(patches),
-                                      maps, info)
-            for commit, passed in verified.items():
-                final[commit] = [n for n in static[commit] if n not in passed]
+                                      maps, info, probes)
         except Exception as e:  # noqa: BLE001
             log(f"verification disabled: {e!r}")
+            verified = {}
+    for commit, (passed, _) in verified.items():
+        final[commit] = [n for n in static[commit] if n not in passed]
+    for commit in probes:
+        passed, ok = verified.get(commit, (set(), None))
+        if ok is False:
+            log(f"{commit}: patched module fails to import -> all tests")
+            final[commit] = all_numbers
+        elif ok is None:
+            log(f"{commit}: import not checked -> wide selection")
+            final[commit] = [n for n in wide.get(commit, all_numbers) if n not in passed]
 
     # ---- 4. output
     out = []
@@ -300,27 +324,36 @@ class Planner:
         return gain, sorted(V), ccpu, cunits
 
 
+def module_name(f: str) -> str:
+    m = f[:-3].replace("/", ".")
+    return m[: -len(".__init__")] if m.endswith(".__init__") else m
+
+
 def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
-                   info=None) -> dict[str, set[int]]:
-    """Returns {commit: numbers of tests that ran and passed on the patched tree}."""
+                   info=None, probes=None) -> dict[str, tuple[set[int], bool | None]]:
+    """{commit: (numbers of tests that ran and passed on the patched tree,
+                 import probe result: True / False / None = not checked)}."""
     import verify
     if not (verify.SRC / "sqlglot" / "__init__.py").is_file():
         log(f"no checkout at {verify.SRC}: static only")
         return {}
     planner = Planner(dur, id_of, num_by_id, maps, verify.SPLITS)
     info = info or {}
+    probes = probes or {}
     plans = []
     for commit, S in static.items():
-        if not S or commit not in texts:
+        if commit not in texts or (not S and commit not in probes):
             continue
         try:
             files = blast.parse_patch(texts[commit])
             if any(not p.startswith(verify.VERIFY_ROOTS)
                    for fc in files for p in (fc.old, fc.new) if p is not None):
                 continue
-            gain, V, ccpu, cunits = planner.plan(S, files, info.get(commit))
+            gain, V, ccpu, cunits = planner.plan(S, files, info.get(commit)) if S else (0, [], {}, {})
             if gain < MARGIN_MS or not V:
-                continue
+                if commit not in probes:
+                    continue
+                gain, V = 0, []  # import probe only
             changes = verify.patched_files(files)
         except Exception as e:  # noqa: BLE001
             log(f"{commit}: not verifiable ({e})")
@@ -339,10 +372,12 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             return worth_continuing(failed, done, V, rest_d, dur, ccpu)
 
         job.on_result = check
+        job.probe = probes.get(commit, [])
         plans.append((gain, commit, job))
     if not plans:
         return {}
-    plans.sort(key=lambda p: (-p[0], p[1]))
+    # import probes first (cheap, and they unlock the attribute rule), then best gain first
+    plans.sort(key=lambda p: (not p[2].probe or bool(p[2].tests), -p[0], p[1]))
     if sys.flags.no_site:
         import site
         site.main()  # main.py runs with -S; the tests need site-packages
@@ -361,7 +396,7 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
     for gain, commit, job in plans:
         passed = {num_by_id[t] for t in job.passed if t in num_by_id} - \
                  {num_by_id[t] for t in job.failed if t in num_by_id}
-        out[commit] = passed
+        out[commit] = (passed, job.probe_ok if job.probe else None)
         log(f"{commit}: verified {len(job.tests)} -> passed {len(passed)}, failed {len(job.failed)}, "
             f"cpu {job.child_cpu:.2f}s tests {job.cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")
     log(f"verification cpu {v.cpu_children:.1f}s")

@@ -244,8 +244,10 @@ class InlinePool:
         return False
 
 
-def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int) -> None:
-    """Run tests [(index, id, units)] from the overlay at root; report over wfd. Never returns."""
+def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
+           probe: list | None = None) -> None:
+    """Run tests [(index, id, units)] from the overlay at root; report over wfd. Never returns.
+    probe: modules to import first ("P 1" if they all import, "P 0" if one raises)."""
     code = 0
     try:
         out = os.fdopen(wfd, "w", buffering=1)
@@ -271,6 +273,16 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int) -> N
         sys.stdout = open(os.devnull, "w")
         sys.stderr = sys.stdout
         import unittest
+
+        if probe:
+            import importlib
+            ok = 1
+            for name in probe:
+                try:
+                    importlib.import_module(name)
+                except BaseException:  # noqa: BLE001
+                    ok = 0
+            say("P", ok)
 
         by_mod: dict[str, list] = {}
         units_of = {}
@@ -395,6 +407,8 @@ class Job:
         self.why = ""
         self.on_result = None           # callable(job) -> False to stop verifying this job
         self.stopped = False
+        self.probe: list[str] = []      # modules whose import must be checked (phase 5a)
+        self.probe_ok: bool | None = None
 
 
 class Verifier:
@@ -446,7 +460,7 @@ class Verifier:
         pid = os.fork()
         if pid == 0:
             os.close(r)
-            _child(job.root, tests, w)
+            _child(job.root, tests, w, job.probe if job.probe_ok is None else None)
         os.close(w)
         os.set_blocking(r, False)
         job.proc = (pid, r)
@@ -535,12 +549,16 @@ class Verifier:
                     job.why += f" stopped({e!r})"
             elif tag == "X":
                 job.why += f" fixture-error:{parts[1] if len(parts) > 1 else '?'}"
+            elif tag == "P":
+                job.probe_ok = parts[1] == "1"
             elif tag == "D":
                 return True
         return False
 
     def _abort_current(self, job: Job, why: str) -> None:
         """The child hung or died: the running test fails; restart for the rest."""
+        if job.probe and job.probe_ok is None and why != "budget":
+            job.probe_ok = False  # died or hung while importing the patched modules
         if job.current is not None:
             i = job.current
             job.failed.add(job.tests[i][0])

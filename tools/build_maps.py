@@ -42,9 +42,13 @@ import ast
 import base64
 import json
 import os
+import sys
 import zlib
 from collections import defaultdict
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import attr_maps  # noqa: E402
 
 ROOT = Path("/opt/sqlglot")
 
@@ -174,6 +178,7 @@ def main() -> None:
     subprocess_bits = 0
     lazy = defaultdict(lambda: defaultdict(set))
     problems = []
+    attr_reads: dict[str, dict[str, int]] = {"attr": {}, "whole": {}, "key": {}}
     for i, tid in enumerate(tests):
         p = a.trace / "tests" / f"{i}.json"
         if not p.exists():
@@ -194,6 +199,12 @@ def main() -> None:
             data_bits[f] |= bit
         if d["subprocess"]:
             subprocess_bits |= bit
+        for k in d.get("attr_reads", []):
+            attr_reads["attr"][k] = attr_reads["attr"].get(k, 0) | bit
+        for k in d.get("whole_reads", []):
+            attr_reads["whole"][k] = attr_reads["whole"].get(k, 0) | bit
+        for k in d.get("key_reads", []):
+            attr_reads["key"][k] = attr_reads["key"].get(k, 0) | bit
         for m, fl in d.get("lazy_imports", {}).items():
             for f, lines in fl.items():
                 lazy[m][f].update(lines)
@@ -205,6 +216,10 @@ def main() -> None:
     for d, parts in meta.get("dialects", {}).items():
         dbits = class_bits.get(d, 0)
         if not dbits:
+            continue
+        if d in meta.get("dialect_part_mros", {}):
+            for k in meta["dialect_part_mros"][d]:  # real ancestry of the dialect's parts
+                class_bits[k] |= dbits
             continue
         for part in parts.values():
             for k in mro(part, meta["classes"], memo):
@@ -283,6 +298,7 @@ def main() -> None:
     index = {}
     sources = sorted({str(p.relative_to(ROOT)) for p in [*ROOT.glob("sqlglot/**/*.py"),
                                                          *ROOT.glob("tests/**/*.py")]})
+    attrs = attr_maps.build(ROOT, sources, meta, attr_reads, problems)
     for f in sources:
         module = f[:-3].replace("/", ".")
         if module.endswith(".__init__"):
@@ -307,6 +323,12 @@ def main() -> None:
             "collect_users": st.add(collect_bits.get(f, 0)),
             "stmts": multiline_statements(ROOT / f),
             "strings": multiline_strings(ROOT / f),
+            # phase 5a: [key-level set, attribute-level set, first line of entry, statement
+            # start] for lines of UPPER_CASE class attributes (-1 = keep the wide rule)
+            "attrs": {str(ln): [-1 if k is None else st.add(k), -1 if av is None else st.add(av),
+                                first, s0]
+                      for ln, (k, av, first, s0) in sorted(attrs.get(f, {}).items())
+                      if k is not None or av is not None},
         }
         payload["sets"] = st.items
         blob = zlib.compress(json.dumps(payload, separators=(",", ":")).encode(), 9)
