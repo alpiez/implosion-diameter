@@ -308,7 +308,8 @@ def main() -> None:
         out.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + ("\n" if out else ""))
     sys.stdout.flush()
-    log(f"done in {time.monotonic() - T_START:.1f}s wall")
+    log(f"done in {time.monotonic() - T_START:.1f}s wall, main process cpu "
+        f"{time.process_time():.2f}s")
 
 
 class Units:
@@ -478,4 +479,32 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
         log(f"{commit}: verified {len(job.tests)} -> passed {len(passed)}, failed {len(job.failed)}, "
             f"cpu {job.child_cpu:.2f}s tests {job.cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")
     log(f"verification cpu {v.cpu_children:.1f}s")
+    log_components(plans, id_of, num_by_id)
     return out
+
+
+def log_components(plans, id_of, num_by_id) -> None:
+    """Phase 6a: verification CPU by component, summed over all jobs (stderr only)."""
+    from collections import defaultdict
+    cat = defaultdict(float)
+    by_file = defaultdict(float)
+    by_test = defaultdict(float)
+    for _, commit, job in plans:
+        known = 0.0
+        for k, c in job.comp.items():
+            kind, _, f = k.partition(":")
+            cat[kind] += c
+            known += c
+            if f:
+                by_file[f"{kind}:{f.split('/')[-1]}"] += c
+        for tid, c in job.tcpu.items():
+            by_test[tid.split("::")[-1]] += c
+            known += c
+        cat["tests"] += sum(job.tcpu.values())
+        cat["untracked"] += max(0.0, job.child_cpu - known)  # fork/exit, stopped tails
+        cat["jobs"] += 1
+    log("cpu components: " + ", ".join(f"{k} {v:.1f}" for k, v in sorted(cat.items())))
+    log("cpu top files: " + ", ".join(f"{k} {v:.1f}" for k, v in
+                                      sorted(by_file.items(), key=lambda x: -x[1])[:10]))
+    log("cpu top tests: " + ", ".join(f"{k} {v:.1f}" for k, v in
+                                      sorted(by_test.items(), key=lambda x: -x[1])[:10]))

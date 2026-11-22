@@ -274,14 +274,24 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
         sys.stderr = sys.stdout
         import unittest
 
+        # phase 6a: CPU by component ("C name seconds"); the child's clock starts at the fork
+        say("C", "start", round(time.process_time(), 4))
+        c0 = time.process_time()
+        try:
+            import sqlglot  # noqa: F401 - the test modules import it first thing anyway
+        except BaseException:  # noqa: BLE001 - the test-module imports will fail the same way
+            pass
+        say("C", "sqlglot", round(time.process_time() - c0, 4))
         if probe:
             import importlib
+            c0 = time.process_time()
             ok = 1
             for name in probe:
                 try:
                     importlib.import_module(name)
                 except BaseException:  # noqa: BLE001
                     ok = 0
+            say("C", "probe", round(time.process_time() - c0, 4))
             say("P", ok)
 
         by_mod: dict[str, list] = {}
@@ -306,6 +316,7 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
                 self.cur = None
                 self.bad = False
                 self.c0 = 0.0
+                self.tsum = 0.0
 
             def startTest(self, test):
                 super().startTest(test)
@@ -317,8 +328,10 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
 
             def stopTest(self, test):
                 super().stopTest(test)
+                dt = time.process_time() - self.c0
+                self.tsum += dt
                 if self.cur is not None:
-                    say("E", self.cur, int(self.bad), round(time.process_time() - self.c0, 4))
+                    say("E", self.cur, int(self.bad), round(dt, 4))
                 self.cur = None
 
             def addError(self, test, err):
@@ -352,6 +365,7 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
         for path, items in by_mod.items():
             mod_name = path[:-3].replace("/", ".")
             owners = [(idx, mod_name, cls) for idx, _, cls, _ in items]
+            c0 = time.process_time()
             try:
                 mod = __import__(mod_name, fromlist=["_"])
                 if hasattr(mod, "ProcessPoolExecutor"):
@@ -361,6 +375,8 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
                 for idx, *_ in items:
                     say("F", idx)
                 continue
+            finally:
+                say("C", "imp:" + path, round(time.process_time() - c0, 4))
             suite = unittest.TestSuite()
             for idx, _, cls, meth in items:
                 try:
@@ -373,7 +389,10 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
                 ids[id(t)] = idx
                 suite.addTest(t)
             res = Result()
+            c0 = time.process_time()
             suite.run(res)
+            # class/module fixtures (setUpClass, tearDownClass) = suite time - test time
+            say("C", "fix:" + path, round(time.process_time() - c0 - res.tsum, 4))
         say("D")
         out.flush()
     except BaseException:  # noqa: BLE001
@@ -394,6 +413,7 @@ class Job:
         self.failed: set[str] = set()
         self.cpu = 0.0                  # CPU reported by the tests themselves
         self.child_cpu = 0.0            # CPU of the child processes (tests + imports + fixtures)
+        self.comp: dict[str, float] = {}  # child CPU by component (phase 6a)
         self.tcpu: dict[str, float] = {}
         self.icpu: dict[int, float] = {}
         self.todo = list(range(len(tests)))
@@ -551,6 +571,8 @@ class Verifier:
                 job.why += f" fixture-error:{parts[1] if len(parts) > 1 else '?'}"
             elif tag == "P":
                 job.probe_ok = parts[1] == "1"
+            elif tag == "C" and len(parts) == 3:
+                job.comp[parts[1]] = job.comp.get(parts[1], 0.0) + float(parts[2])
             elif tag == "D":
                 return True
         return False
