@@ -418,8 +418,15 @@ class Selector:
         self.core = set(maps.meta.get("core_modules", []))
         self.noncov = 0                           # tests selected NOT via runtime coverage
         self.covlines: list[tuple[str, int]] = []  # (file, line) whose coverage was used
-        self.use_attrs = True                     # phase 5a attribute rule (needs an import probe)
-        self.attr_files: list[str] = []           # files where the attribute rule was used
+        # Import-time edits (class bodies, module level) are selected assuming the patched
+        # modules still import; the verifier checks that by importing probe_files (if one
+        # fails: all tests). With assume_imports False (no probe possible) the rules widen.
+        self.assume_imports = True
+        self.probe_files: list[str] = []
+        # phase 5c evidence: tests that execute a changed line or read a changed class
+        # attribute/key (direct), and tests that read a changed data file
+        self.direct = 0
+        self.databits = 0
 
     # ---- users of a module: tests that executed it or used a class defined in it
     def mod_users(self, f: str, with_importers: bool = True) -> int:
@@ -438,6 +445,28 @@ class Selector:
                         bits |= self.m.s(q, q["file_tests"]) | self.m.s(q, q["collect_users"])
         if f in self.core:
             bits |= self.m.g(self.m.meta["subprocess"])
+        return bits
+
+    def probe(self, f: str) -> int:
+        """Ask for an import probe of f; returns the tests to add when no probe can run."""
+        if not f.startswith("sqlglot/") or f.endswith("/__main__.py"):
+            return 0  # __main__ is the CLI: importing it runs it, and no test imports it
+        if f not in self.probe_files:
+            self.probe_files.append(f)
+        if self.assume_imports:
+            return 0
+        if f in self.core:
+            return self.m.g(self.m.meta["all"])
+        return self.mod_users(f) | self.collect_users(f)
+
+    def probe_class(self, p: dict, qual: str) -> int:
+        """Modules that instantiate class qual (or an enclosing class) while importing."""
+        bits = 0
+        parts = qual.split(".")
+        ci = p.get("class_import", {})
+        for i in range(1, len(parts) + 1):
+            for mf in ci.get(".".join(parts[:i]), ()):
+                bits |= self.probe(mf)
         return bits
 
     def collect_users(self, f: str) -> int:
@@ -494,6 +523,7 @@ class Selector:
         cov = p["cov"].get(str(ln))
         if cov is not None:
             bits |= self.m.s(p, cov)
+            self.direct |= bits
             self.covlines.append((f, ln))
         mods = p["imp"].get(str(ln))
         chain = scopes(p["struct"], ln)
@@ -516,6 +546,7 @@ class Selector:
             else:
                 nc |= self.class_users(p, f, inner[3]) or self.mod_users(f)
                 nc |= self.body_cov(p, inner[0], inner[1])
+                nc |= self.probe(f) | self.probe_class(p, inner[3])
             chain = chain[:-1]
             inner = chain[-1] if chain else None
             if (inner is None or inner[2] == "c") and f.startswith("tests/"):
@@ -525,7 +556,7 @@ class Selector:
         if inner is not None and inner[2] == "f":
             if mods:  # a function body that ran at import time (metaclass, module-level call)
                 for mf in mods:
-                    nc |= self.mod_users(mf) | self.collect_users(mf)
+                    nc |= self.mod_users(mf) | self.collect_users(mf) | self.probe(mf)
             self.noncov |= nc
             return bits | nc
         if inner is not None and inner[2] == "c":
@@ -534,10 +565,11 @@ class Selector:
                 cu |= self.m.s(p, p["file_tests"]) | self.m.s(p, p["collect_users"])
             if not cu:
                 cu = self.mod_users(f)
+            cu |= self.probe(f) | self.probe_class(p, inner[3])
             self.noncov |= cu
             return bits | cu
         # module level
-        nc |= self.mod_users(f)
+        nc |= self.mod_users(f) | self.probe(f)
         self.noncov |= nc
         return bits | nc
 
@@ -604,12 +636,15 @@ class Selector:
         for block in fc.blocks:
             if non_semantic(p, block):
                 continue
-            ab = self.attr_block(f, p, block) if self.use_attrs else None
+            ab = self.attr_block(f, p, block) if self.assume_imports else None
             if ab is not None:
                 bits |= ab
                 self.noncov |= ab
-                if f not in self.attr_files:
-                    self.attr_files.append(f)
+                self.direct |= ab
+                self.probe(f)
+                for st in p["struct"]:
+                    if st[2] == "c" and st[0] <= block.old_start <= st[1]:
+                        self.probe_class(p, st[3])
                 why.append(f"{f}@{block.old_start}: class attribute -> {bin(ab).count('1')}")
                 continue
             for ln in sorted(self.affected_lines(p, block)):
@@ -632,12 +667,15 @@ class Selector:
         for path in {fc.old, fc.new} - {None}:
             bits |= self.m.data_users(path)
         why.append(f"{f}: data -> {bin(bits).count('1')}")
+        self.databits |= bits
         return bits
 
     def select(self, text: str, why: list) -> int:
         self.noncov = 0
         self.covlines = []
-        self.attr_files = []
+        self.probe_files = []
+        self.direct = 0
+        self.databits = 0
         return self._select(text, why)
 
     def _select(self, text: str, why: list) -> int:

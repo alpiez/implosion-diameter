@@ -139,6 +139,60 @@ def worth_continuing(job_failed: set, job_done: set, V: list, rest_d: list, dur:
     return 0.5 * (now - best) > 1000 * sum(ccpu[n] for n in left) + MARGIN_MS
 
 
+# ---- phase 5c: cheap tests as evidence for expensive ones
+EV_CAP = float(os.environ.get("BR_EV_CAP", "0"))      # max CPU (s) of an evidence test; 0 = off
+EV_K = int(os.environ.get("BR_EV_K", "3"))            # min number of evidence tests
+EV_MODE = os.environ.get("BR_EV_MODE", "cov")         # which unverified tests may be dropped
+EV_COVER = os.environ.get("BR_EV_COVER", "1") == "1"  # evidence must run every changed line
+EV_Q = float(os.environ.get("BR_EV_Q", "0"))          # P(evidence all passes); 0 = prior_q
+
+
+def evidence_plan(S, V, direct: set, noncov: set, ccpu: dict, line_tests: list | None = None):
+    """(E, D): evidence tests E (cheap tests that execute a changed line or read a changed
+    attribute/key) and the tests D that may be dropped WITHOUT running them if every test
+    of E (and of V) passes on the patched tree. ([], []) when the rule does not apply.
+      cov mode: D = unverified tests selected only through runtime line coverage
+      all mode: D = every unverified test
+    line_tests: [(tests executing changed line 1), ...]; with EV_COVER every changed line
+    that a test of D executes must also be executed by a test of E."""
+    if EV_CAP <= 0:
+        return [], []
+    Vs = set(V)
+    E = sorted(n for n in S if n in direct and ccpu.get(n, 1e9) <= EV_CAP)
+    if len(E) < EV_K:
+        return [], []
+    Es = set(E)
+    rest = [n for n in S if n not in Vs and n not in Es]
+    if EV_MODE == "cov":
+        D = [n for n in rest if n not in noncov]
+    else:
+        D = rest
+    if not D:
+        return [], []
+    if EV_COVER and line_tests is not None:
+        Ds = set(D)
+        for lt in line_tests:
+            if lt & Ds and not lt & Es:
+                return [], []
+    return E, D
+
+
+def evidence_worth(S, V, E, D, dur: dict, ccpu: dict, file_of: dict, file_ovh: dict,
+                   q: float) -> bool:
+    """Is running E (besides V) worth it for the chance (q) of dropping D?"""
+    Vs = set(V)
+    extra = [n for n in E if n not in Vs]
+    files_v = {file_of[n] for n in V}
+    files_ve = files_v | {file_of[n] for n in extra}
+    cpu = sum(ccpu[n] for n in extra) + overhead(files_ve, file_ovh) - (
+        overhead(files_v, file_ovh) if V else 0.0)
+    gone = Vs | set(E) | set(D)
+    before = pack_cost([dur[n] for n in S if n not in Vs])
+    after = pack_cost([dur[n] for n in S if n not in gone])
+    q = EV_Q or q
+    return q * (before - after) > 1000 * (1 + MARGIN_REL) * cpu + MARGIN_MS
+
+
 def prior_q(files) -> float:
     """Prior that the candidates all pass: fixture corruptions nearly always break their
     reader, code edits often do not (equivalent or uncovered mutants)."""
@@ -198,16 +252,24 @@ def main() -> None:
                 texts[commit] = text
                 bits = sel.select(text, why)
                 info[commit] = (sel.noncov, sel.covlines)
+                if EV_CAP > 0:
+                    lt = []
+                    for f, ln in set(sel.covlines):
+                        pf = maps.file(f)
+                        si = pf["cov"].get(str(ln)) if pf else None
+                        if si is not None:
+                            lt.append(set(to_nums(maps.s(pf, si))))
+                    info[commit] += (set(to_nums(sel.direct)), set(to_nums(sel.noncov)), lt)
                 nums = to_nums(bits)
-                if sel.attr_files:
-                    # the attribute rule assumes the patched module still imports: keep the
-                    # wide selection for when that cannot be checked
-                    probes[commit] = [module_name(f) for f in sel.attr_files]
-                    sel.use_attrs = False
+                if sel.probe_files:
+                    # the import-time rules assume the patched modules still import: keep the
+                    # widened selection for when that cannot be checked
+                    probes[commit] = [module_name(f) for f in sel.probe_files]
+                    sel.assume_imports = False
                     try:
                         wide[commit] = to_nums(sel.select(text, []))
                     finally:
-                        sel.use_attrs = True
+                        sel.assume_imports = True
         except Exception as e:  # noqa: BLE001
             why.append(f"error {e!r} -> all")
             nums = all_numbers
@@ -315,7 +377,7 @@ class Planner:
         """(expected gain ms, V, cpu estimates, {number: unit indices})."""
         ccpu, cunits = self.cpu, {}
         for n in self.split_nums.keys() & set(S):
-            r = self.units.reachable(self.split_nums[n], *(info or (-1, [])))
+            r = self.units.reachable(self.split_nums[n], *(info or (-1, []))[:2])
             if r is not None:
                 if ccpu is self.cpu:
                     ccpu = dict(self.cpu)
@@ -349,11 +411,20 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             if any(not p.startswith(verify.VERIFY_ROOTS)
                    for fc in files for p in (fc.old, fc.new) if p is not None):
                 continue
-            gain, V, ccpu, cunits = planner.plan(S, files, info.get(commit)) if S else (0, [], {}, {})
+            inf = info.get(commit)
+            gain, V, ccpu, cunits = planner.plan(S, files, inf) if S else (0, [], {}, {})
             if gain < MARGIN_MS or not V:
-                if commit not in probes:
-                    continue
-                gain, V = 0, []  # import probe only
+                gain, V = 0, []
+            E, D = [], []
+            if S and inf is not None and len(inf) > 2:
+                E, D = evidence_plan(S, V, inf[2], inf[3], ccpu, inf[4])
+                if E and not evidence_worth(S, V, E, D, dur, ccpu, planner.file_of,
+                                            planner.file_ovh, prior_q(files)):
+                    E, D = [], []
+                if E:
+                    V = sorted(set(V) | set(E))
+            if not V and commit not in probes:
+                continue  # (else: import probe only)
             changes = verify.patched_files(files)
         except Exception as e:  # noqa: BLE001
             log(f"{commit}: not verifiable ({e})")
@@ -373,6 +444,7 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
 
         job.on_result = check
         job.probe = probes.get(commit, [])
+        job.evidence = (E, D)
         plans.append((gain, commit, job))
     if not plans:
         return {}
@@ -396,6 +468,12 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
     for gain, commit, job in plans:
         passed = {num_by_id[t] for t in job.passed if t in num_by_id} - \
                  {num_by_id[t] for t in job.failed if t in num_by_id}
+        E, D = job.evidence
+        if E and all(n in passed for n in E):
+            # phase 5c: every evidence test passed -> drop D without running it
+            log(f"{commit}: evidence {len(E)} tests passed -> dropping {len(D)} unverified: "
+                + ", ".join(id_of[n].split("::")[-1] for n in D)[:200])
+            passed = passed | set(D)
         out[commit] = (passed, job.probe_ok if job.probe else None)
         log(f"{commit}: verified {len(job.tests)} -> passed {len(passed)}, failed {len(job.failed)}, "
             f"cpu {job.child_cpu:.2f}s tests {job.cpu:.2f}s (planned gain {gain / 1000:.1f}s){job.why}")

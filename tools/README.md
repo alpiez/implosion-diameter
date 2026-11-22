@@ -25,7 +25,7 @@ docker build -f dev/Dockerfile -t br-dev .
 | `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. |
 | `preload_list.py` | **Regenerates `maps/preload.json`**: the standard-library modules sqlglot and its tests import (fresh interpreter, submission image). The verifier imports them once before forking. Pinned commit only. |
 | `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Evaluation only. |
-| `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. Evaluation only. |
+| `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. Phase 5c: `--ev-cap/--ev-k/--ev-mode/--ev-cover/--ev-always/--report` replay the evidence rule. Evaluation only. |
 
 Typical loop:
 

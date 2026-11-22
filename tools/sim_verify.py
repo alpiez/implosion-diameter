@@ -27,8 +27,26 @@ def main() -> None:
     ap.add_argument("--rel", type=float)
     ap.add_argument("--q-code", type=float)
     ap.add_argument("--cpu-scale", type=float, default=1.0, help="scorer CPU / our CPU")
+    ap.add_argument("--ev-cap", type=float, help="phase 5c: evidence CPU cap (s); 0 = off")
+    ap.add_argument("--ev-k", type=int)
+    ap.add_argument("--ev-mode", choices=["cov", "all"])
+    ap.add_argument("--ev-cover", type=int, choices=[0, 1])
+    ap.add_argument("--ev-data", action="store_true", help="readers of a changed data file count as evidence")
+    ap.add_argument("--ev-always", action="store_true", help="skip the worth check (analysis)")
+    ap.add_argument("--report", type=Path, help="write per-commit 5c records (JSON lines)")
     ap.add_argument("-v", action="store_true")
     a = ap.parse_args()
+    if a.ev_cap is not None:
+        runner.EV_CAP = a.ev_cap
+    if a.ev_k is not None:
+        runner.EV_K = a.ev_k
+    if a.ev_mode is not None:
+        runner.EV_MODE = a.ev_mode
+    if a.ev_cover is not None:
+        runner.EV_COVER = bool(a.ev_cover)
+    rep = a.report.open("w") if a.report else None
+    ev_applied = ev_miss = ev_fired = 0
+    ev_saving = 0
     if a.rel is not None:
         runner.MARGIN_REL = a.rel
     if a.q_data is not None:
@@ -48,6 +66,7 @@ def main() -> None:
         vc = json.loads(a.vcpu.read_text())
         planner.cpu = {n: float(vc["cpu"].get(id_of[n], dur[n] / 1000)) for n in dur}
         planner.file_ovh = vc["file_overhead"]
+    bn = [num_by_id.get(t) for t in maps.tests]
     tot_s = tot_v = tot_o = tot_cpu = 0
     nver = misses = 0
     for line in a.verify.open():
@@ -65,7 +84,60 @@ def main() -> None:
         if "passed" in m:
             gain, V, ccpu, cunits = planner.plan(S, runner.blast.parse_patch(text),
                                                  (sel.noncov, sel.covlines))
-            if V and gain >= a.margin:
+            if not (V and gain >= a.margin):
+                V = []
+            nums = lambda bits: {bn[i] for i in range(len(bn)) if bits >> i & 1 and bn[i] is not None}
+            direct = nums(sel.direct | (sel.databits if a.ev_data else 0))
+            noncov = nums(sel.noncov)
+            line_tests = []
+            for f, ln in set(sel.covlines):
+                pf = maps.file(f)
+                si = pf["cov"].get(str(ln)) if pf else None
+                if si is not None:
+                    line_tests.append(nums(maps.s(pf, si)))
+            E, D = runner.evidence_plan(S, V, direct, noncov, ccpu, line_tests)
+            if E and not a.ev_always and not runner.evidence_worth(
+                    S, V, E, D, dur, ccpu, planner.file_of, planner.file_ovh,
+                    runner.prior_q(runner.blast.parse_patch(text))):
+                E, D = [], []
+            outcome = set(m["passed"])
+            if E:
+                ev_applied += 1
+                e_ok = all(n in outcome for n in E)
+                base_keep = [n for n in S if not (n in set(V) and n in outcome)]
+                if e_ok:
+                    ev_fired += 1
+                    keep = [n for n in base_keep if n not in set(D) and not (n in set(E) and n in outcome)]
+                else:
+                    keep = [n for n in base_keep if not (n in set(E) and n in outcome)]
+                e_cpu = sum(ccpu[n] for n in E if n not in set(V))
+                files = {planner.file_of[n] for n in set(V) | set(E)}
+                v_cpu = sum(ccpu[n] for n in V)
+                cpu5 = (e_cpu + v_cpu + runner.overhead(files, planner.file_ovh)) * a.cpu_scale
+                cv = runner.pack_cost([dur[n] for n in keep]) + int(1000 * cpu5)
+                missed = bool(F - set(keep)) and not (F - set(S))
+                if F - set(S):
+                    cv += 300000  # static miss
+                if missed:
+                    cv += 300000
+                    ev_miss += 1
+                    misses += 1
+                # what phase 4 alone would have cost (V only, all of V run)
+                k4 = [n for n in S if not (n in set(V) and n in outcome)]
+                c4 = (300000 if F - set(S) else 0) + runner.pack_cost([dur[n] for n in k4]) + (int(1000 * a.cpu_scale * (
+                    v_cpu + runner.overhead({planner.file_of[n] for n in V}, planner.file_ovh))) if V else 0)
+                ev_saving += c4 - cv
+                tot_cpu += cpu5
+                nver += 1
+                if rep:
+                    rep.write(json.dumps({"commit": m["commit"], "kind": m.get("kind"), "E": len(E),
+                                          "D": [planner.id_of[n].split("::")[-1] for n in D],
+                                          "e_ok": e_ok, "missed": missed, "saving": c4 - cv,
+                                          "e_cpu": round(e_cpu, 2)}) + "\n")
+                if a.v:
+                    print(f"{m['commit']} 5c E={len(E)} D={len(D)} e_ok={e_ok} missed={missed} "
+                          f"{c4/1000:.1f} -> {cv/1000:.1f}")
+            elif V:
                 V = sorted(V, key=lambda n: (ccpu[n], n))
                 rest_d = [dur[n] for n in S if n not in set(V)]
                 outcome_pass = set(m["passed"])
@@ -99,6 +171,9 @@ def main() -> None:
         tot_s += cs
         tot_v += cv
         tot_o += co
+    if runner.EV_CAP > 0:
+        print(f"  5c: applied {ev_applied}, evidence all passed {ev_fired}, misses {ev_miss}, "
+              f"saving vs phase 4 {ev_saving/1000:.1f}s")
     print(f"{a.data.name}: static {tot_s/1000:.1f}s -> verified {tot_v/1000:.1f}s "
           f"(verify cpu {tot_cpu:.1f}s, {nver} commits verified, misses {misses}); oracle {tot_o/1000:.1f}s")
 

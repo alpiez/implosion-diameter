@@ -231,3 +231,70 @@ def build(root: Path, sources: list, meta: dict, reads: dict, problems: list) ->
           f"{n_consumed} consumed at import, {n_key} table entries at key level, "
           f"{len(c0)} names read by class hooks", file=sys.stderr)
     return out
+
+
+def _pure_chain(node) -> bool:
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    return isinstance(node, ast.Name)
+
+
+def class_derivations(root: Path, sources: list, classes: dict, problems: list) -> dict:
+    """{C key: {D key}}: class D's body (class-level statements, evaluated at import) reads an
+    attribute of class C (`arg_types = {**Grant.arg_types, ...}`), so an edit to C's body also
+    changes D. Names are resolved in the live module (class-local names first), and only
+    attribute reads count: a bare class reference (a TRANSFORMS key) depends on its identity,
+    not on its body."""
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    out: dict = defaultdict(set)
+    for f in sources:
+        if not f.startswith("sqlglot/"):
+            continue
+        module = f[:-3].replace("/", ".")
+        if module.endswith(".__init__"):
+            module = module[: -len(".__init__")]
+        if module == "sqlglot.__main__":
+            continue  # the CLI entry point: no classes, and importing it runs the CLI
+        try:
+            mod = importlib.import_module(module)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"class_derivations: cannot import {module}: {e!r}"[:200])
+            continue
+        tree = ast.parse((root / f).read_text())
+
+        def visit(body, owner, prefix):
+            for st in body:
+                if isinstance(st, ast.ClassDef):
+                    q = prefix + st.name
+                    obj = getattr(owner, st.name, None) if owner is not None else None
+                    visit(st.body, obj if isinstance(obj, type) else None, q + ".")
+                    continue
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) or not prefix:
+                    continue
+                dkey = f"{module}:{prefix[:-1]}"
+                if dkey not in classes:
+                    continue
+                ns = dict(vars(mod))
+                if owner is not None:
+                    ns.update(vars(owner))
+                for n in ast.walk(st):
+                    if not isinstance(n, ast.Attribute) or not _pure_chain(n.value):
+                        continue
+                    try:
+                        val = eval(compile(ast.Expression(body=n.value), f, "eval"), {}, ns)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if isinstance(val, type) and val.__module__.startswith("sqlglot"):
+                        # a method / nested class reference reads the body only when called
+                        # (at runtime, by instances: class users already cover it)
+                        if callable(getattr(val, n.attr, None)):
+                            continue
+                        ckey = f"{val.__module__}:{val.__qualname__}"
+                        if ckey != dkey and ckey in classes:
+                            out[ckey].add(dkey)
+
+        visit(tree.body, mod, "")
+    print(f"class_derivations: {sum(len(v) for v in out.values())} edges from "
+          f"{len(out)} classes", file=sys.stderr)
+    return out

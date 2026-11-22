@@ -56,6 +56,7 @@ IMPORT_EDGES: set[tuple[str, str]] = set()
 TEST_FILES: set[str] = set()
 IMPORT_FILES: dict[str, set[str]] = {}
 USED_CLASSES: set[type] = set()
+IMPORT_INST: dict[str, set[type]] = {}  # module file -> classes instantiated while importing it
 FLAGS: dict[str, bool] = {"subprocess": False}
 # phase 5a: class-attribute reads per test (Dialect/Tokenizer/Parser/Generator families)
 ATTR_READS: set[str] = set()   # "module:Qual.NAME" read (any access)
@@ -207,6 +208,59 @@ def all_subclasses(c: type) -> set[type]:
     return out
 
 
+# The roots' __init__ are wrapped as soon as their module has executed, so instantiation
+# during later imports (templates parsed at import, Literal.number(...) constants) is seen:
+# a class-body edit to such a class can break that module's import (phase 5b finding).
+EARLY_ROOTS = {"sqlglot.expressions.core": "Expr", "sqlglot.tokens": "Tokenizer",
+               "sqlglot.parser": "Parser", "sqlglot.generator": "Generator",
+               "sqlglot.dialects.dialect": "Dialect"}
+
+
+def _record_instance(self) -> None:
+    if STATE["mode"] == "test":
+        USED_CLASSES.add(type(self))
+    elif STATE["stack"]:
+        IMPORT_INST.setdefault(STATE["stack"][-1], set()).add(type(self))
+
+
+def _early_wrap(c) -> None:
+    if not isinstance(c, type):
+        return
+    orig = c.__dict__.get("__init__")
+    if orig is not None and getattr(orig, "_br_wrapped", False):
+        return
+    if orig is None:
+        def __init__(self, *a, __sup=c, **k):
+            _record_instance(self)
+            return super(__sup, self).__init__(*a, **k)
+    else:
+        @functools.wraps(orig)
+        def __init__(self, *a, **k):
+            _record_instance(self)
+            return orig(self, *a, **k)
+    __init__._br_wrapped = True
+    c.__init__ = __init__
+
+
+class _EarlyFinder:
+    """Meta path hook: wrap a root class's __init__ right after its module executes."""
+
+    def find_spec(self, name, path, target=None):
+        if name not in EARLY_ROOTS:
+            return None
+        import importlib.machinery
+        spec = importlib.machinery.PathFinder.find_spec(name, path)
+        if spec is None or spec.loader is None or not hasattr(spec.loader, "exec_module"):
+            return spec
+        orig = spec.loader.exec_module
+
+        def exec_module(module, orig=orig, cls=EARLY_ROOTS[name]):
+            orig(module)
+            _early_wrap(getattr(module, cls, None))
+        spec.loader.exec_module = exec_module
+        return spec
+
+
 def install_class_tracking() -> list[type]:
     from sqlglot.dialects.dialect import Dialect, _Dialect
     from sqlglot.expressions.core import Expr
@@ -227,7 +281,7 @@ def install_class_tracking() -> list[type]:
 
         @functools.wraps(orig)
         def __init__(self, *a, **k):
-            USED_CLASSES.add(type(self))
+            _record_instance(self)
             return orig(self, *a, **k)
 
         __init__._br_wrapped = True
@@ -240,7 +294,7 @@ def install_class_tracking() -> list[type]:
             wrap(c)
         if "__init__" not in r.__dict__:  # make sure instantiation is seen
             def __init__(self, *a, __sup=r, **k):
-                USED_CLASSES.add(type(self))
+                _record_instance(self)
                 return super(__sup, self).__init__(*a, **k)
             r.__init__ = __init__
 
@@ -550,6 +604,7 @@ def main() -> None:
 
     # 1. `import sqlglot` alone: what a bare import executes (subprocess tests use this)
     before = set(sys.modules)
+    sys.meta_path.insert(0, _EarlyFinder())
     import sqlglot  # noqa: F401
     core_modules = sorted(m for m in set(sys.modules) - before if m.startswith("sqlglot"))
     ATTRS = os.environ.get("BR_ATTRS", "1") != "0"
@@ -650,6 +705,7 @@ def main() -> None:
                     for k, v in sorted(classes.items())},
         "dialects": dialects,
         "dialect_part_mros": {k: sorted(v) for k, v in sorted(dialect_mros.items())},
+        "import_instances": {f: mro_keys(cs) for f, cs in sorted(IMPORT_INST.items())},
         "import_attr_reads": sorted(IMPORT_ATTR),
         "import_key_reads": sorted(IMPORT_KEYS),
         "tests": [t["id"] for t in json.loads(Path(a.tests).read_text())["tests"]],

@@ -271,6 +271,36 @@ def main() -> None:
     # collection-time import closure per test file (tools/import_closure.py)
     collect_bits: dict[str, int] = defaultdict(int)
     closure_path = a.trace / "closure.json"
+
+    # Class bodies that copy another class's attributes (`{**Grant.arg_types, ...}`): an
+    # edit to C's body also changes D, so D's users are C's users (transitively). Classes
+    # instantiated while a module is imported: an edit to C can break that import, so the
+    # selector probes those modules (phase 5b).
+    sources_all = sorted(str(q.relative_to(ROOT)) for q in ROOT.glob("sqlglot/**/*.py"))
+    derived = attr_maps.class_derivations(ROOT, sources_all, meta["classes"], problems)
+    changed = True
+    while changed:
+        changed = False
+        for c, ds in derived.items():
+            b = class_bits.get(c, 0)
+            for d in ds:
+                b |= class_bits.get(d, 0)
+            if b != class_bits.get(c, 0):
+                class_bits[c] = b
+                changed = True
+    import_mods: dict[str, set[str]] = defaultdict(set)
+    for mf, keys in meta.get("import_instances", {}).items():
+        for k in keys:
+            import_mods[k].add(mf)
+    changed = True
+    while changed:
+        changed = False
+        for c, ds in derived.items():
+            before = len(import_mods[c])
+            for d in ds:
+                import_mods[c] |= import_mods.get(d, set())
+            changed |= len(import_mods[c]) != before
+
     if closure_path.exists():
         closure = json.loads(closure_path.read_text())
         for tf, r in closure["test_files"].items():
@@ -306,18 +336,24 @@ def main() -> None:
         st = SetTable()
         struct = structure(ROOT / f)
         cu = {}
+        ci = {}
         mod_users = any_bits.get(f, 0)
         for s in struct:
             if s[2] == "c":
                 bits = class_bits.get(f"{module}:{s[3]}", 0)
                 cu[s[3]] = st.add(bits)
                 mod_users |= bits
+                im = sorted(import_mods.get(f"{module}:{s[3]}", ()))
+                if im:
+                    ci[s[3]] = im
         payload = {
             "cov": {str(ln): st.add(bits) for ln, bits in sorted(cov.get(f, {}).items())},
             "imp": {str(ln): sorted(ms) for ln, ms in sorted(imp.get(f, {}).items())},
             "struct": struct,
             "any": st.add(any_bits.get(f, 0)),
             "class_users": cu,
+            # modules that instantiate the class (or a subclass) while being imported
+            "class_import": ci,
             "mod_users": st.add(mod_users),
             "file_tests": st.add(file_test_bits.get(f, 0)),
             "collect_users": st.add(collect_bits.get(f, 0)),
