@@ -214,6 +214,9 @@ def cap_duckdb() -> None:
     duckdb.connect = connect
 
 
+PROGRESS = None  # child: callable reporting that the next unit of work starts (phase 6e)
+
+
 class InlinePool:
     """Drop-in for the tests' ProcessPoolExecutor: runs work in-process, pickling like a pool."""
 
@@ -224,6 +227,8 @@ class InlinePool:
     def submit(self, fn, *args, **kwargs):
         from concurrent.futures import Future
         fut = Future()
+        if PROGRESS is not None:
+            PROGRESS()
         try:
             a, k = pickle.loads(pickle.dumps((args, kwargs)))
             fut.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
@@ -296,7 +301,15 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
 
         by_mod: dict[str, list] = {}
         units_of = {}
-        for idx, tid, units in tests:
+        progress = {idx for idx, _, _, lim in tests if lim}  # tests with per-unit limits
+        global PROGRESS
+
+        def _progress():
+            if res_cur[0] in progress:
+                say("U")
+        res_cur = [None]
+        PROGRESS = _progress
+        for idx, tid, units, _ in tests:
             path, cls, meth = tid.split("::")
             by_mod.setdefault(path, []).append((idx, path, cls, meth))
             if units is not None:
@@ -321,6 +334,7 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
             def startTest(self, test):
                 super().startTest(test)
                 self.cur = ids.get(id(test))
+                res_cur[0] = self.cur
                 self.bad = False
                 self.c0 = time.process_time()
                 if self.cur is not None:
@@ -426,6 +440,8 @@ class Job:
         self.buf = b""
         self.current = None
         self.deadline = 0.0
+        self.test_deadline = 0.0
+        self.units_started = 0
         self.done = False
         self.restarts = 0
         self.why = ""
@@ -479,7 +495,8 @@ class Verifier:
         r, w = os.pipe()
         import gc
         gc.freeze()  # preloaded objects: not rescanned by every child's GC, fewer copy-on-write faults
-        tests = [(i, job.tests[i][0], job.tests[i][2] if len(job.tests[i]) > 2 else None)
+        tests = [(i, job.tests[i][0], job.tests[i][2] if len(job.tests[i]) > 2 else None,
+                  bool(job.tests[i][3]) if len(job.tests[i]) > 3 else False)
                  for i in job.todo]
         pid = os.fork()
         if pid == 0:
@@ -545,7 +562,16 @@ class Verifier:
             if tag == "S":
                 i = int(parts[1])
                 job.current = i
-                job.deadline = time.monotonic() + job.tests[i][1]
+                job.deadline = job.test_deadline = time.monotonic() + job.tests[i][1]
+                job.units_started = 0
+            elif tag == "U" and job.current is not None:
+                # a unit (query) of a split test starts: its own limit, so a slow-down shows up
+                # at the first slow unit instead of after the whole test's budget (phase 6e)
+                lim = job.tests[job.current][3] if len(job.tests[job.current]) > 3 else None
+                k = job.units_started
+                job.units_started += 1
+                if lim and k < len(lim):
+                    job.deadline = min(job.test_deadline, time.monotonic() + lim[k])
             elif tag == "E":
                 i = int(parts[1])
                 tid = job.tests[i][0]

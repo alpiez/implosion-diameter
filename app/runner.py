@@ -30,7 +30,7 @@ MAX_REST = 40                      # largest number of expensive tests kept unve
 BASE_OVERHEAD_S = 0.10             # fork, overlay, import sqlglot (precompiled)
 IMPORT_FLOOR_S = 0.048             # the smallest per-file overhead = the shared bare import
 PARALLEL = int(os.environ.get("BR_PARALLEL", "2"))
-BUDGET_PER_COMMIT_S = 2.25         # the limit is about 4.5 s of wall time per commit
+BUDGET_PER_COMMIT_S = float(os.environ.get("BR_BUDGET_PER_COMMIT", "2.25"))  # limit: about 4.5 s wall per commit
 BUDGET_CAP_S = float(os.environ.get("BR_BUDGET_CAP", "150"))
 
 
@@ -323,6 +323,25 @@ def main() -> None:
         f"{time.process_time():.2f}s")
 
 
+# The executor tests' measured CPU (with the phase 6c caches) is scaled up for PLANNING only:
+# their failures are the costliest to verify (slow-downs run into the time limit), and the
+# measured cost alone made the planner verify them too eagerly. Tuned on calib + synth,
+# checked on holdout + confirm (CHANGELOG.md, Phase 6e).
+EXEC_PLAN_SCALE = float(os.environ.get("BR_EXEC_PLAN_SCALE", "1.25"))
+EXEC_FILE = "tests/test_executor.py"
+
+
+def scale_executor(vc: dict, k: float) -> dict:
+    vc = dict(vc)
+    pre = EXEC_FILE + "::"
+    vc["cpu"] = {t: (c * k if t.startswith(pre) else c) for t, c in vc["cpu"].items()}
+    vc["units"] = {t: ([None if x is None else x * k for x in u] if t.startswith(pre) else u)
+                   for t, u in vc.get("units", {}).items()}
+    vc["file_overhead"] = {f: (c * k if f == EXEC_FILE else c)
+                           for f, c in vc["file_overhead"].items()}
+    return vc
+
+
 class Units:
     """Per-unit coverage of the split tests (maps/units.bin, verify.SPLITS)."""
 
@@ -374,8 +393,12 @@ class Units:
 class Planner:
     """Per-commit verification plan: which candidates to run (and which units of split tests)."""
 
-    def __init__(self, dur: dict, id_of: dict, num_by_id: dict, maps, splits: dict):
-        vc = json.loads((blast.MAPS / "vcpu.json").read_text())
+    def __init__(self, dur: dict, id_of: dict, num_by_id: dict, maps, splits: dict,
+                 vc: dict | None = None, plan_scale: bool = True):
+        if vc is None:
+            vc = json.loads((blast.MAPS / "vcpu.json").read_text())
+        if plan_scale and EXEC_PLAN_SCALE != 1.0:
+            vc = scale_executor(vc, EXEC_PLAN_SCALE)
         self.dur = dur
         self.id_of = id_of
         self.file_ovh = vc["file_overhead"]
@@ -384,6 +407,19 @@ class Planner:
         self.units = Units(maps, vc, splits) if maps is not None else None
         self.split_nums = {num_by_id[t]: t for t in (self.units.tests if self.units else {})
                            if t in num_by_id}
+
+    def unit_limits(self, n: int, units) -> list | None:
+        """Per-unit time limits (s) for a split test whose units report progress (verify
+        PROGRESS): a slow unit fails the test early instead of after its whole budget."""
+        tid = self.split_nums.get(n)
+        if tid is None or tid not in self.units.tests:
+            return None
+        ucpu = self.units.tests[tid][2]
+        order = list(units) if units is not None else list(range(len(ucpu)))
+        lim = [TIMEOUT_MULT * float(ucpu[u]) + 1.0 for u in order]
+        if lim:
+            lim[-1] += 2.0 + 0.1 * len(lim)  # the result comparisons after the last unit
+        return lim
 
     def plan(self, S: list[int], files: list, info) -> tuple[int, list, dict, dict]:
         """(expected gain ms, V, cpu estimates, {number: unit indices})."""
@@ -442,7 +478,8 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             log(f"{commit}: not verifiable ({e})")
             continue
         V.sort(key=lambda n: (ccpu[n], n))  # cheapest first: failures show up early
-        tl = [(id_of[n], timeout_s(ccpu[n]), cunits.get(n)) for n in V]
+        tl = [(id_of[n], timeout_s(ccpu[n]), cunits.get(n), planner.unit_limits(n, cunits.get(n)))
+              for n in V]
         for n in V:
             if n in cunits:
                 log(f"{commit}: {id_of[n].split('::')[-1]} narrowed to {len(cunits[n])} units")

@@ -21,7 +21,10 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, required=True)
     ap.add_argument("--verify", type=Path, required=True)
-    ap.add_argument("--vcpu", type=Path, default=ROOT / "maps" / "vcpu.json")
+    ap.add_argument("--vcpu", type=Path, default=ROOT / "maps" / "vcpu.json",
+                    help="CPU estimates the planner decides with")
+    ap.add_argument("--real-vcpu", type=Path,
+                    help="CPU actually charged for tests that run (default: --vcpu)")
     ap.add_argument("--margin", type=int, default=runner.MARGIN_MS)
     ap.add_argument("--q-data", type=float)
     ap.add_argument("--rel", type=float)
@@ -61,11 +64,10 @@ def main() -> None:
     import verify
     maps = runner.blast.Maps(runner.blast.MAPS)
     sel = runner.blast.Selector(maps)
-    planner = runner.Planner(dur, id_of, num_by_id, maps, verify.SPLITS)
-    if a.vcpu != ROOT / "maps" / "vcpu.json":
-        vc = json.loads(a.vcpu.read_text())
-        planner.cpu = {n: float(vc["cpu"].get(id_of[n], dur[n] / 1000)) for n in dur}
-        planner.file_ovh = vc["file_overhead"]
+    planner = runner.Planner(dur, id_of, num_by_id, maps, verify.SPLITS,
+                             json.loads(a.vcpu.read_text()))
+    real = runner.Planner(dur, id_of, num_by_id, maps, verify.SPLITS,
+                          json.loads((a.real_vcpu or a.vcpu).read_text()), plan_scale=False)
     bn = [num_by_id.get(t) for t in maps.tests]
     tot_s = tot_v = tot_o = tot_cpu = 0
     nver = misses = 0
@@ -144,19 +146,23 @@ def main() -> None:
                 passed, failed, done = set(), set(), set()
                 real_cpu = 0.0
                 why = m.get("why", "")
+                rcpu = real.plan(S, runner.blast.parse_patch(text), (sel.noncov, sel.covlines))[2]
                 for n in V:   # sequential replay with the runtime's stopping rule
                     ok = n in outcome_pass
                     if not ok and f"timeout:{id_of[n].split('::')[-1]}" in why:
-                        real_cpu += runner.timeout_s(ccpu[n])  # a timeout costs its budget
+                        # a timeout costs its budget; split tests with per-unit limits stop at
+                        # the first slow unit (measured: about 0.2-1.0x the planned CPU)
+                        lim = planner.unit_limits(n, cunits.get(n))
+                        real_cpu += (0.6 * ccpu[n] + 1.0) if lim else runner.timeout_s(ccpu[n])
                     else:
-                        real_cpu += ccpu[n] if (ok or n in cunits) else min(
-                            ccpu[n], float(m["tcpu"].get(str(n), ccpu[n])))
+                        real_cpu += rcpu[n] if (ok or n in cunits) else min(
+                            rcpu[n], float(m["tcpu"].get(str(n), rcpu[n])))
                     (passed if ok else failed).add(n)
                     done.add(n)
                     if failed and not runner.worth_continuing(failed, done, V, rest_d, dur, ccpu):
                         break
                 keep = [n for n in S if n not in passed]
-                real_cpu += runner.overhead({planner.file_of[n] for n in V}, planner.file_ovh)
+                real_cpu += runner.overhead({planner.file_of[n] for n in V}, real.file_ovh)
                 real_cpu *= a.cpu_scale
                 cv = runner.pack_cost([dur[n] for n in keep]) + int(1000 * real_cpu)
                 nver += 1
