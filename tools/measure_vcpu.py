@@ -29,10 +29,23 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--parallel", type=int, default=2)
+    ap.add_argument("--exec-cache", action="store_true", help="phase 6c executor caches on")
+    ap.add_argument("--only-file", help="measure only this test file (and its split tests)")
+    ap.add_argument("--merge", type=Path, help="update this vcpu.json instead of starting empty")
     a = ap.parse_args()
+    if a.exec_cache:
+        import exec_cache
+        print("executor cache loaded:", exec_cache.load(), file=sys.stderr)
+
+    def mk(key, tl):
+        j = verify.Job(key, noop, tl)
+        j.exec_ok = a.exec_cache
+        return j
     tests = json.loads(a.tests.read_text())["tests"]
     by_file: dict[str, list] = {}
     for t in tests:
+        if a.only_file and not t["id"].startswith(a.only_file + "::"):
+            continue
         by_file.setdefault(t["id"].split("::")[0], []).append((t["id"], max(30.0, 5 * t["seconds"] + 10)))
     noop = {"sqlglot/py.typed": (verify.SRC / "sqlglot/py.typed").read_text()
             if (verify.SRC / "sqlglot/py.typed").exists() else ""}
@@ -42,7 +55,7 @@ def main() -> None:
     ovh: dict[str, list] = {}
     failed = set()
     for rep in range(a.reps):
-        jobs = [verify.Job(f, noop, tl) for f, tl in by_file.items()]
+        jobs = [mk(f, tl) for f, tl in by_file.items()]
         t0 = time.monotonic()
         v.run(jobs, time.monotonic() + 1e6)
         for j in jobs:
@@ -54,10 +67,11 @@ def main() -> None:
     # split tests: CPU of each unit alone (one child per test, every unit as its own test)
     import zlib
     units = json.loads(zlib.decompress((ROOT / "maps" / "units.bin").read_bytes()))
+    if a.only_file:
+        units = {t: d for t, d in units.items() if t.startswith(a.only_file + "::")}
     ucpu: dict[str, list] = {}
     for rep in range(a.reps):
-        jobs = [verify.Job(tid, noop, [(tid, 120.0, [u]) for u in range(d["n"])])
-                for tid, d in units.items()]
+        jobs = [mk(tid, [(tid, 120.0, [u]) for u in range(d["n"])]) for tid, d in units.items()]
         v.run(jobs, time.monotonic() + 1e6)
         for j in jobs:
             if len(j.icpu) != len(j.tests) or j.failed:
@@ -69,6 +83,12 @@ def main() -> None:
            "cpu": {t: round(statistics.median(c), 4) for t, c in sorted(cpu.items())},
            "file_overhead": {f: round(statistics.median(c), 4) for f, c in sorted(ovh.items())},
            "failed_clean": sorted(failed)}
+    if a.merge:
+        base = json.loads(a.merge.read_text())
+        for k in ("units", "cpu", "file_overhead"):
+            base[k].update(out[k])
+        base["failed_clean"] = sorted(set(base.get("failed_clean", [])) | set(out["failed_clean"]))
+        out = base
     a.out.write_text(json.dumps(out, indent=0, sort_keys=True))
     print(f"{len(out['cpu'])} tests, clean failures: {sorted(failed)[:10]}", file=sys.stderr)
 

@@ -22,9 +22,9 @@ docker build -f dev/Dockerfile -t br-dev .
 | `attr_maps.py` | Phase 5a, called by `build_maps.py`: per-line readers of UPPER_CASE class attributes and table entries, with import-time consumption checks (class hooks, import-time reads, class-body derivations). |
 | `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
 | `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
-| `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. |
+| `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. Flags: `--exec-cache`, `--only-file F`, `--merge vcpu.json` (re-measure one file into an existing table). |
 | `preload_list.py` | **Regenerates `maps/preload.json`**: the standard-library modules sqlglot and its tests import (fresh interpreter, submission image). The verifier imports them once before forking. Pinned commit only. |
-| `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Evaluation only. |
+| `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Flags: `--only-file F` (only that file's candidates), `--exec-cache` (phase 6c caches; needs the submission image), `--runtime-timeouts vcpu.json` (per-test limits as at runtime). Evaluation only. |
 | `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. Phase 5c: `--ev-cap/--ev-k/--ev-mode/--ev-cover/--ev-always/--report` replay the evidence rule. Evaluation only. |
 
 Typical loop:

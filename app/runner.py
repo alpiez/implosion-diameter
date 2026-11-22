@@ -34,6 +34,17 @@ BUDGET_PER_COMMIT_S = 2.25         # the limit is about 4.5 s of wall time per c
 BUDGET_CAP_S = float(os.environ.get("BR_BUDGET_CAP", "150"))
 
 
+# A test running longer than this (wall) counts as failed (kept selected): never unsafe, but a
+# timeout costs its whole budget in CPU. The labellers' limit is 90 s per test (about 8x the
+# cached tpcds CPU), so a slow-down they would see as a timeout still trips this one.
+TIMEOUT_MULT = float(os.environ.get("BR_TIMEOUT_MULT", "2.0"))
+TIMEOUT_ADD_S = 3.0
+
+
+def timeout_s(cpu: float) -> float:
+    return TIMEOUT_MULT * cpu + TIMEOUT_ADD_S
+
+
 def log(*a) -> None:
     print("[runner]", *a, file=sys.stderr, flush=True)
 
@@ -431,7 +442,7 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             log(f"{commit}: not verifiable ({e})")
             continue
         V.sort(key=lambda n: (ccpu[n], n))  # cheapest first: failures show up early
-        tl = [(id_of[n], 3.0 * ccpu[n] + 3.0, cunits.get(n)) for n in V]
+        tl = [(id_of[n], timeout_s(ccpu[n]), cunits.get(n)) for n in V]
         for n in V:
             if n in cunits:
                 log(f"{commit}: {id_of[n].split('::')[-1]} narrowed to {len(cunits[n])} units")
@@ -445,6 +456,10 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
 
         job.on_result = check
         job.probe = probes.get(commit, [])
+        if any(t[0].startswith("tests/test_executor.py::") for t in tl):
+            import exec_cache
+            job.exec_ok = exec_cache.guard_ok(
+                [q for fc in files for q in (fc.old, fc.new) if q is not None])
         job.evidence = (E, D)
         plans.append((gain, commit, job))
     if not plans:
@@ -458,6 +473,12 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
         preload = json.loads((blast.MAPS / "preload.json").read_text())
     except Exception:  # noqa: BLE001
         preload = []
+    if any(p[2].exec_ok for p in plans):
+        import exec_cache
+        c0 = time.process_time()
+        ok = exec_cache.load()  # before the forks: the children share it
+        log(f"executor cache {'loaded' if ok else 'unavailable'} in "
+            f"{time.process_time() - c0:.2f}s cpu")
     v = verify.Verifier(parallel=PARALLEL, preload=preload)
     budget = min(BUDGET_CAP_S, BUDGET_PER_COMMIT_S * n_commits)
     deadline = T_START + budget

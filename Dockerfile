@@ -23,6 +23,10 @@ RUN mv /opt/sqlglot-${SQLGLOT_COMMIT} /opt/sqlglot \
 #       import contexts, class usage, data files, collection-time imports). See CHANGELOG.md.
 COPY app/ /app/
 COPY maps/ /app/maps/
+# Executor-test caches (app/exec_cache.py): the pinned test code's parsed TPC-H/TPC-DS rows
+# and DuckDB's results for the pinned transpiled queries. Nothing here depends on a patch.
+RUN cd / && PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 SKIP_INTEGRATION=0 \
+    PYTHONPATH=/opt/sqlglot python /app/exec_cache.py
 RUN python -m compileall -q /app \
  && chmod -R a+rX /app
 

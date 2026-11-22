@@ -143,10 +143,14 @@ def main() -> None:
                 outcome_pass = set(m["passed"])
                 passed, failed, done = set(), set(), set()
                 real_cpu = 0.0
+                why = m.get("why", "")
                 for n in V:   # sequential replay with the runtime's stopping rule
                     ok = n in outcome_pass
-                    real_cpu += ccpu[n] if (ok or n in cunits) else min(
-                        ccpu[n], float(m["tcpu"].get(str(n), ccpu[n])))
+                    if not ok and f"timeout:{id_of[n].split('::')[-1]}" in why:
+                        real_cpu += runner.timeout_s(ccpu[n])  # a timeout costs its budget
+                    else:
+                        real_cpu += ccpu[n] if (ok or n in cunits) else min(
+                            ccpu[n], float(m["tcpu"].get(str(n), ccpu[n])))
                     (passed if ok else failed).add(n)
                     done.add(n)
                     if failed and not runner.worth_continuing(failed, done, V, rest_d, dur, ccpu):

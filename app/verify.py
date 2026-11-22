@@ -245,7 +245,7 @@ class InlinePool:
 
 
 def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
-           probe: list | None = None) -> None:
+           probe: list | None = None, exec_ok: bool = False) -> None:
     """Run tests [(index, id, units)] from the overlay at root; report over wfd. Never returns.
     probe: modules to import first ("P 1" if they all import, "P 0" if one raises)."""
     code = 0
@@ -371,6 +371,9 @@ def _child(root: Path, tests: list[tuple[int, str, list | None]], wfd: int,
                 if hasattr(mod, "ProcessPoolExecutor"):
                     mod.ProcessPoolExecutor = InlinePool
                 cap_duckdb()
+                if exec_ok and path == "tests/test_executor.py":
+                    import exec_cache
+                    say("C", "exec_cache", int(exec_cache.install(mod)))
             except BaseException:  # noqa: BLE001 - collection error: the file's tests fail
                 for idx, *_ in items:
                     say("F", idx)
@@ -414,6 +417,7 @@ class Job:
         self.cpu = 0.0                  # CPU reported by the tests themselves
         self.child_cpu = 0.0            # CPU of the child processes (tests + imports + fixtures)
         self.comp: dict[str, float] = {}  # child CPU by component (phase 6a)
+        self.exec_ok = False            # use the executor-test caches (phase 6c, exec_cache.py)
         self.tcpu: dict[str, float] = {}
         self.icpu: dict[int, float] = {}
         self.todo = list(range(len(tests)))
@@ -480,7 +484,7 @@ class Verifier:
         pid = os.fork()
         if pid == 0:
             os.close(r)
-            _child(job.root, tests, w, job.probe if job.probe_ok is None else None)
+            _child(job.root, tests, w, job.probe if job.probe_ok is None else None, job.exec_ok)
         os.close(w)
         os.set_blocking(r, False)
         job.proc = (pid, r)

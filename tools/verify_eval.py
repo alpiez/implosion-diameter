@@ -31,10 +31,20 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--parallel", type=int, default=4)
     ap.add_argument("--only", nargs="*")
+    ap.add_argument("--only-file", help="verify only candidates from this test file")
+    ap.add_argument("--runtime-timeouts", type=Path,
+                    help="vcpu.json: per-test timeouts as at runtime (3 x cpu + 3 s)")
+    ap.add_argument("--exec-cache", action="store_true", help="phase 6c executor caches")
     ap.add_argument("--max-sum", type=float, default=1e9, help="skip commits whose S sums above this (s)")
     a = ap.parse_args()
 
     preload = json.loads((ROOT / "maps" / "preload.json").read_text())  # as at runtime
+    rt = json.loads(a.runtime_timeouts.read_text())["cpu"] if a.runtime_timeouts else None
+
+    def timeout(t):
+        if rt is not None:
+            return 3.0 * float(rt.get(t["id"], max(0.05, t["seconds"]))) + 3.0
+        return max(10.0, 4 * t["seconds"] + 5)
     v = verify.Verifier(parallel=a.parallel, gap_timeout=120, preload=preload)
     tests = json.loads((a.data / "tests.json").read_text())["tests"]
     num = {t["id"]: t["number"] for t in tests}
@@ -68,8 +78,19 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             m["skip"] = f"patch: {e}"
             continue
-        tl = [(by_num[n]["id"], max(10.0, 4 * by_num[n]["seconds"] + 5)) for n in S]
-        jobs.append(verify.Job(c, changes, tl))
+        tl = [(by_num[n]["id"], timeout(by_num[n])) for n in S
+              if not a.only_file or by_num[n]["id"].startswith(a.only_file + "::")]
+        if not tl:
+            m["skip"] = "no candidates in --only-file"
+            continue
+        job = verify.Job(c, changes, tl)
+        if a.exec_cache:
+            import exec_cache
+            job.exec_ok = exec_cache.guard_ok([p for fc in files for p in (fc.old, fc.new) if p])
+        jobs.append(job)
+    if a.exec_cache:
+        import exec_cache
+        print("executor cache loaded:", exec_cache.load(), file=sys.stderr)
     t0 = time.monotonic()
     v.run(jobs, deadline=time.monotonic() + 1e6)
     with a.out.open("w") as out:
