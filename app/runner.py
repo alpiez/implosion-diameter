@@ -397,6 +397,8 @@ class Planner:
                  vc: dict | None = None, plan_scale: bool = True):
         if vc is None:
             vc = json.loads((blast.MAPS / "vcpu.json").read_text())
+        self._args = (dur, id_of, num_by_id, maps, splits, vc)
+        self._nocache = None
         if plan_scale and EXEC_PLAN_SCALE != 1.0:
             vc = scale_executor(vc, EXEC_PLAN_SCALE)
         self.dur = dur
@@ -407,6 +409,19 @@ class Planner:
         self.units = Units(maps, vc, splits) if maps is not None else None
         self.split_nums = {num_by_id[t]: t for t in (self.units.tests if self.units else {})
                            if t in num_by_id}
+
+    def without_cache(self) -> "Planner":
+        """The planner for a commit whose executor tests run WITHOUT the phase 6c caches
+        (exec_cache.guard_ok fails, or no cache): their measured uncached CPU (vcpu.json
+        "nocache"), unscaled, for both the plan and the per-unit time limits."""
+        if self._nocache is None:
+            dur, id_of, num_by_id, maps, splits, vc = self._args
+            nc = vc.get("nocache") or {}
+            vc = dict(vc)
+            for key in ("cpu", "units", "file_overhead"):
+                vc[key] = {**vc.get(key, {}), **nc.get(key, {})}
+            self._nocache = Planner(dur, id_of, num_by_id, maps, splits, vc, plan_scale=False)
+        return self._nocache
 
     def unit_limits(self, n: int, units) -> list | None:
         """Per-unit time limits (s) for a split test whose units report progress (verify
@@ -447,7 +462,9 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
     if not (verify.SRC / "sqlglot" / "__init__.py").is_file():
         log(f"no checkout at {verify.SRC}: static only")
         return {}
+    import exec_cache
     planner = Planner(dur, id_of, num_by_id, maps, verify.SPLITS)
+    cache_ok = exec_cache.available()
     info = info or {}
     probes = probes or {}
     plans = []
@@ -460,14 +477,18 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
                    for fc in files for p in (fc.old, fc.new) if p is not None):
                 continue
             inf = info.get(commit)
-            gain, V, ccpu, cunits = planner.plan(S, files, inf) if S else (0, [], {}, {})
+            # the executor caches apply only when the patch leaves their inputs alone
+            exec_ok = cache_ok and exec_cache.guard_ok(
+                [q for fc in files for q in (fc.old, fc.new) if q is not None])
+            pl = planner if exec_ok else planner.without_cache()
+            gain, V, ccpu, cunits = pl.plan(S, files, inf) if S else (0, [], {}, {})
             if gain < MARGIN_MS or not V:
                 gain, V = 0, []
             E, D = [], []
             if S and inf is not None and len(inf) > 2:
                 E, D = evidence_plan(S, V, inf[2], inf[3], ccpu, inf[4])
-                if E and not evidence_worth(S, V, E, D, dur, ccpu, planner.file_of,
-                                            planner.file_ovh, prior_q(files)):
+                if E and not evidence_worth(S, V, E, D, dur, ccpu, pl.file_of,
+                                            pl.file_ovh, prior_q(files)):
                     E, D = [], []
                 if E:
                     V = sorted(set(V) | set(E))
@@ -478,7 +499,7 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
             log(f"{commit}: not verifiable ({e})")
             continue
         V.sort(key=lambda n: (ccpu[n], n))  # cheapest first: failures show up early
-        tl = [(id_of[n], timeout_s(ccpu[n]), cunits.get(n), planner.unit_limits(n, cunits.get(n)))
+        tl = [(id_of[n], timeout_s(ccpu[n]), cunits.get(n), pl.unit_limits(n, cunits.get(n)))
               for n in V]
         for n in V:
             if n in cunits:
@@ -493,10 +514,8 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
 
         job.on_result = check
         job.probe = probes.get(commit, [])
-        if any(t[0].startswith("tests/test_executor.py::") for t in tl):
-            import exec_cache
-            job.exec_ok = exec_cache.guard_ok(
-                [q for fc in files for q in (fc.old, fc.new) if q is not None])
+        if any(t[0].startswith(EXEC_FILE + "::") for t in tl):
+            job.exec_ok = exec_ok
         job.evidence = (E, D)
         plans.append((gain, commit, job))
     if not plans:
@@ -516,6 +535,12 @@ def verify_commits(static, texts, dur, id_of, num_by_id, n_commits, maps=None,
         ok = exec_cache.load()  # before the forks: the children share it
         log(f"executor cache {'loaded' if ok else 'unavailable'} in "
             f"{time.process_time() - c0:.2f}s cpu")
+        if not ok:  # planned with cached costs but running without: no unit limits, 2x time
+            for _, _, job in plans:
+                if job.exec_ok:
+                    job.exec_ok = False
+                    job.tests = [(t[0], 2 * t[1], t[2], None) if t[0].startswith(EXEC_FILE + "::")
+                                 else t for t in job.tests]
     v = verify.Verifier(parallel=PARALLEL, preload=preload)
     budget = min(BUDGET_CAP_S, BUDGET_PER_COMMIT_S * n_commits)
     deadline = T_START + budget

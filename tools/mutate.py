@@ -219,6 +219,9 @@ def main() -> None:
     ap.add_argument("--profile", choices=["synth", "sample"], default="synth",
                     help="sample: the sample's kind mix (code 16 / fixture 8 / multi 3 / comment 3), "
                          "mutation points uniform over the code base, more is -> == swaps")
+    ap.add_argument("--deep-fixtures", action="store_true",
+                    help="also mutate SQL fixtures in subdirectories (tpc-h/, tpc-ds/, ...); "
+                         "without it only top-level files are picked (all sets up to phase 6e)")
     a = ap.parse_args()
     PROFILE["name"] = a.profile
     rng = random.Random(a.seed)
@@ -228,8 +231,11 @@ def main() -> None:
     test_py = sorted(str(r) for r in (p.relative_to(a.src) for p in (a.src / "tests").rglob("*.py"))
                      if "fixtures" not in r.parts and r.name not in ("gen_fixtures.py", "leakcheck.py")
                      and "sqlglot" not in r.parts[1:])
-    fx_opt = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures/optimizer").glob("*.sql"))
-    fx_other = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures").glob("*.sql"))
+    glob = "**/*.sql" if a.deep_fixtures else "*.sql"
+    fx_opt = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures/optimizer").glob(glob))
+    fx_other = sorted(str(p.relative_to(a.src)) for p in (a.src / "tests/fixtures").glob(glob))
+    if a.deep_fixtures:
+        fx_other = [f for f in fx_other if not f.startswith("tests/fixtures/optimizer/")]
 
     weights = None
     if a.profile == "sample":  # pick files in proportion to their mutation points

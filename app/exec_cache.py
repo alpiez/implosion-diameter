@@ -35,12 +35,23 @@ def guard_ok(paths) -> bool:
     return not any(p and p.startswith(GUARDED) for p in paths)
 
 
+def _path() -> Path:
+    return CACHE if CACHE.exists() else Path("/app/cache/executor.pkl")  # tools run from /w
+
+
+def available() -> bool:
+    """Cheap check (no unpickling) used when planning."""
+    try:
+        return _path().stat().st_size > 0
+    except OSError:
+        return False
+
+
 def load() -> bool:
     global DATA
     if DATA is None:
-        path = CACHE if CACHE.exists() else Path("/app/cache/executor.pkl")  # tools run from /w
         try:
-            with path.open("rb") as f:
+            with _path().open("rb") as f:
                 DATA = pickle.load(f)
         except Exception:  # noqa: BLE001 - no cache: the tests run as usual
             DATA = {}

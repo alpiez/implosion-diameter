@@ -14,7 +14,7 @@ docker build -f dev/Dockerfile -t br-dev .
 | `oracle_plugin.py` | pytest plugin that records any failed report per nodeid (including subtests, setup and teardown), collection errors, and failure text. |
 | `labels.py` | Oracle JSON lines to `answers.json` format (test numbers). |
 | `eval.py` | Scores a selector on labelled patches: `--image` (scorer flags, CPU measured inside the container via `cpuwrap.py`), `--cmd` (local, reads `$BR_DATA`), or `--output`. |
-| `mutate.py` | Synthetic patches in the sample's styles (`--profile sample`: the sample's kind mix, mutation points chosen uniformly across the code base). **Local evaluation only, never shipped or used as a lookup table.** |
+| `mutate.py` | Synthetic patches in the sample's styles (`--profile sample`: the sample's kind mix, mutation points chosen uniformly across the code base; `--deep-fixtures`: also fixtures in subdirectories such as `tpc-ds/`, which no set before phase 6f contains). **Local evaluation only, never shipped or used as a lookup table.** |
 | `edge.py` | Hand-made edge-case patches (evaluation only). |
 | `make_maps.sh` | **Regenerates `maps/` from the pinned commit only**: runs `trace_map.py`, then `import_closure.py`, then `build_maps.py`. About 1 min, byte-identical output. |
 | `trace_map.py` | Inside br-dev: a fork-per-test tracer (`sys.monitoring`). Records each test's lines, classes used, files opened and subprocess use, plus per-module import contexts, the import graph and the class table. |
@@ -22,7 +22,7 @@ docker build -f dev/Dockerfile -t br-dev .
 | `attr_maps.py` | Phase 5a, called by `build_maps.py`: per-line readers of UPPER_CASE class attributes and table entries, with import-time consumption checks (class hooks, import-time reads, class-body derivations). |
 | `build_maps.py` | Compacts the raw trace into `maps/meta.json` and `maps/files.bin` (format in its docstring). |
 | `check_maps.py` | Map-recall check: replays labelled patches against the maps with naive rules. Evaluation only. |
-| `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. Flags: `--exec-cache`, `--only-file F`, `--merge vcpu.json` (re-measure one file into an existing table). |
+| `measure_vcpu.py` | **Regenerates `maps/vcpu.json`** (phase 4): clean-tree CPU of every test and every split-test unit, measured through `app/verify.py` inside the submission image, plus overhead per test file. Pinned commit only. Flags: `--exec-cache`, `--only-file F`, `--merge vcpu.json` (re-measure one file into an existing table; keeps the `nocache` key). |
 | `preload_list.py` | **Regenerates `maps/preload.json`**: the standard-library modules sqlglot and its tests import (fresh interpreter, submission image). The verifier imports them once before forking. Pinned commit only. |
 | `verify_eval.py` | Phase 4 safety check: verifies ALL static candidates of labelled commits inside the image and reports `unsafe` (labelled failing but passed in the verifier) and `extra`. Flags: `--only-file F` (only that file's candidates), `--exec-cache` (phase 6c caches; needs the submission image), `--runtime-timeouts vcpu.json` (per-test limits as at runtime). Evaluation only. |
 | `sim_verify.py` | Replays the runtime verification plan (`runner.Planner`) on `verify_eval.py` results, with real outcomes. Used to tune the cost model. `--vcpu` = estimates the planner decides with, `--real-vcpu` = CPU charged for tests that run (phase 6e). Phase 5c: `--ev-cap/--ev-k/--ev-mode/--ev-cover/--ev-always/--report` replay the evidence rule. Evaluation only. |
@@ -47,6 +47,12 @@ tools/make_maps.sh                             # also traces split-test units ->
 docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub \
     python /w/tools/measure_vcpu.py --tests /w/sample/tests.json --out /out/vcpu.json
 cp work/vcpu.json maps/vcpu.json
+# phase 6c/6f: the executor tests are measured twice. maps/vcpu.json holds the CACHED costs
+# (planning for commits whose patch leaves the cache inputs alone); its "nocache" key holds the
+# uncached cpu/units/file_overhead of tests/test_executor.py (planning and per-unit limits when
+# exec_cache.guard_ok fails). A full re-measure (no --merge) must rebuild both:
+#   uncached run -> copy its test_executor.py entries into "nocache";
+#   then measure_vcpu.py --only-file tests/test_executor.py --exec-cache --merge maps/vcpu.json
 docker run --rm -v "$PWD":/w:ro -v "$PWD/maps":/maps br-sub python /w/tools/preload_list.py --out /maps/preload.json
 docker run --rm -v "$PWD":/w:ro -v "$PWD/work":/out br-sub python /w/tools/verify_eval.py \
     --data /w/work/synth --answers /w/work/synth/answers.json --out /out/synth_verify.jsonl --parallel 10
